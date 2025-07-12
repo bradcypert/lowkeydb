@@ -23,6 +23,10 @@ pub const DatabaseError = error{
     OutOfMemory,
     InvalidOperation,
     
+    // Type system errors
+    TypeMismatch,
+    InvalidInput,
+    
     // Transaction errors
     TransactionAborted,
     TransactionNotFound,

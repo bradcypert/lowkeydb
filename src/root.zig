@@ -1,4 +1,5 @@
 const std = @import("std");
+const logging = @import("logging.zig");
 
 // Public API exports
 pub const Database = @import("database.zig").Database;
@@ -22,6 +23,8 @@ test "basic database operations" {
     defer {
         db.close();
         std.fs.cwd().deleteFile(db_path) catch {};
+        // Clean up global logger to prevent memory leaks in tests
+        logging.deinitGlobalLogger(allocator);
     }
     
     // Test put and get
@@ -63,6 +66,8 @@ test "database creation and basic operations" {
     defer {
         db.close();
         std.fs.cwd().deleteFile(db_path) catch {};
+        // Clean up global logger to prevent memory leaks in tests
+        logging.deinitGlobalLogger(allocator);
     }
     
     try db.put("test", "value");

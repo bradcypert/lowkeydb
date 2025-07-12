@@ -74,7 +74,6 @@ pub const Transaction = struct {
         self.undo_log.deinit();
         self.held_locks.deinit();
     }
-    
     /// Add an operation to the undo log
     pub fn logOperation(self: *Self, operation: OperationType, key: []const u8, old_value: ?[]const u8, new_value: ?[]const u8, page_id: u32) !void {
         if (self.state != .active) {
@@ -101,28 +100,23 @@ pub const Transaction = struct {
     pub fn isActive(self: *const Self) bool {
         return self.state == .active;
     }
-    
     /// Check if transaction has timed out
     pub fn hasTimedOut(self: *const Self) bool {
         const current_time = std.time.milliTimestamp();
         return (current_time - self.start_time) > self.lock_timeout_ms;
     }
-    
     /// Mark transaction as committed
     pub fn markCommitted(self: *Self) void {
         self.state = .committed;
     }
-    
     /// Mark transaction as aborted
     pub fn markAborted(self: *Self) void {
         self.state = .aborted;
     }
-    
     /// Add a page lock to the transaction
     pub fn addLock(self: *Self, page_id: u32) !void {
         try self.held_locks.append(page_id);
     }
-    
     /// Get all locks held by this transaction
     pub fn getHeldLocks(self: *const Self) []const u32 {
         return self.held_locks.items;
@@ -150,17 +144,14 @@ pub const TransactionManager = struct {
             .database_ref = null,
         };
     }
-    
     /// Set the rollback callback function
     pub fn setRollbackCallback(self: *Self, callback: *const fn(transaction: *Transaction, database: *anyopaque, allocator: std.mem.Allocator) DatabaseError!void) void {
         self.rollback_callback = callback;
     }
-    
     /// Set the database reference for rollback operations
     pub fn setDatabaseReference(self: *Self, database: *anyopaque) void {
         self.database_ref = database;
     }
-    
     pub fn deinit(self: *Self) void {
         self.manager_mutex.lock();
         defer self.manager_mutex.unlock();
@@ -187,7 +178,6 @@ pub const TransactionManager = struct {
         try self.active_transactions.put(tx_id, transaction);
         return transaction;
     }
-    
     /// Commit a transaction
     pub fn commitTransaction(self: *Self, tx_id: u64) !void {
         self.manager_mutex.lock();
@@ -231,7 +221,6 @@ pub const TransactionManager = struct {
                     try callback(transaction, db_ref, self.allocator);
                 }
             }
-            
             // Remove from active transactions
             _ = self.active_transactions.remove(tx_id);
             
@@ -250,7 +239,6 @@ pub const TransactionManager = struct {
         
         return self.active_transactions.get(tx_id);
     }
-    
     /// Check if a transaction exists and is active
     pub fn isTransactionActive(self: *Self, tx_id: u64) bool {
         if (self.getTransaction(tx_id)) |transaction| {
@@ -258,7 +246,6 @@ pub const TransactionManager = struct {
         }
         return false;
     }
-    
     /// Get count of active transactions
     pub fn getActiveTransactionCount(self: *Self) usize {
         self.manager_mutex.lock();
@@ -266,7 +253,6 @@ pub const TransactionManager = struct {
         
         return self.active_transactions.count();
     }
-    
     /// Clean up timed out transactions
     pub fn cleanupTimedOutTransactions(self: *Self) !void {
         self.manager_mutex.lock();
@@ -301,7 +287,6 @@ pub const TransactionLockSet = struct {
     read_locks: std.ArrayList(u32),
     write_locks: std.ArrayList(u32),
     allocator: std.mem.Allocator,
-    
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .read_locks = std.ArrayList(u32).init(allocator),
@@ -309,27 +294,22 @@ pub const TransactionLockSet = struct {
             .allocator = allocator,
         };
     }
-    
     pub fn deinit(self: *Self) void {
         self.read_locks.deinit();
         self.write_locks.deinit();
     }
-    
     pub fn addReadLock(self: *Self, page_id: u32) !void {
         try self.read_locks.append(page_id);
     }
-    
     pub fn addWriteLock(self: *Self, page_id: u32) !void {
         try self.write_locks.append(page_id);
     }
-    
     pub fn hasReadLock(self: *const Self, page_id: u32) bool {
         for (self.read_locks.items) |lock_page_id| {
             if (lock_page_id == page_id) return true;
         }
         return false;
     }
-    
     pub fn hasWriteLock(self: *const Self, page_id: u32) bool {
         for (self.write_locks.items) |lock_page_id| {
             if (lock_page_id == page_id) return true;

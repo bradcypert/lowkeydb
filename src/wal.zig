@@ -1,6 +1,7 @@
 const std = @import("std");
 const DatabaseError = @import("error.zig").DatabaseError;
 const Threading = @import("threading.zig").Threading;
+const logging = @import("logging.zig");
 
 /// Write-Ahead Log system for LowkeyDB providing durability and crash recovery
 pub const WAL = struct {
@@ -394,7 +395,7 @@ pub const WAL = struct {
             self.is_recovery_mode = true;
             defer self.is_recovery_mode = false;
             
-            std.debug.print("Starting WAL recovery...\n", .{});
+            logging.info("Starting WAL recovery", null);
             
             var iterator = try RecoveryIterator.init(self);
             defer iterator.deinit();
@@ -407,7 +408,7 @@ pub const WAL = struct {
             defer aborted_transactions.deinit();
             
             // First pass: Identify committed and aborted transactions
-            std.debug.print("First pass: Identifying transaction outcomes...\n", .{});
+            logging.info("WAL recovery first pass: identifying transaction outcomes", null);
             var first_pass_iterator = try RecoveryIterator.init(self);
             defer first_pass_iterator.deinit();
             
@@ -425,53 +426,49 @@ pub const WAL = struct {
                 }
             }
             
-            std.debug.print("Found {} committed transactions, {} aborted transactions\n", .{ committed_transactions.count(), aborted_transactions.count() });
-            
             // Second pass: Replay operations for committed transactions only
-            std.debug.print("Second pass: Replaying committed operations...\n", .{});
+            logging.info("WAL recovery second pass: replaying committed operations", null);
             
             while (try iterator.next()) |entry| {
                 defer self.allocator.free(entry.data);
                 
-                std.debug.print("Processing WAL record: {s} for transaction {}\n", .{ entry.header.record_type.toString(), entry.header.transaction_id });
                 
                 switch (entry.header.record_type) {
                     .transaction_begin, .transaction_commit, .transaction_abort => {
                         // Skip transaction control records in replay
-                        std.debug.print("  -> Skipping transaction control record\n", .{});
+                        logging.debug("Skipping transaction control record", null);
                     },
                     .insert => {
                         // Only replay if transaction was committed
                         if (committed_transactions.contains(entry.header.transaction_id)) {
                             try self.replayInsertOperation(database, entry.data);
-                            std.debug.print("  -> Replayed INSERT operation\n", .{});
+                            logging.debug("Replayed INSERT operation", null);
                         } else {
-                            std.debug.print("  -> Skipped INSERT (transaction not committed)\n", .{});
+                            logging.debug("Skipped INSERT (transaction not committed)", null);
                         }
                     },
                     .update => {
                         // Only replay if transaction was committed
                         if (committed_transactions.contains(entry.header.transaction_id)) {
                             try self.replayUpdateOperation(database, entry.data);
-                            std.debug.print("  -> Replayed UPDATE operation\n", .{});
+                            logging.debug("Replayed UPDATE operation", null);
                         } else {
-                            std.debug.print("  -> Skipped UPDATE (transaction not committed)\n", .{});
+                            logging.debug("Skipped UPDATE (transaction not committed)", null);
                         }
                     },
                     .delete => {
                         // Only replay if transaction was committed
                         if (committed_transactions.contains(entry.header.transaction_id)) {
                             try self.replayDeleteOperation(database, entry.data);
-                            std.debug.print("  -> Replayed DELETE operation\n", .{});
+                            logging.debug("Replayed DELETE operation", null);
                         } else {
-                            std.debug.print("  -> Skipped DELETE (transaction not committed)\n", .{});
+                            logging.debug("Skipped DELETE (transaction not committed)", null);
                         }
                     },
                     .checkpoint => {
                         if (entry.data.len >= @sizeOf(CheckpointRecord)) {
                             const checkpoint_data = std.mem.bytesToValue(CheckpointRecord, entry.data[0..@sizeOf(CheckpointRecord)]);
                             self.last_checkpoint_lsn.store(checkpoint_data.last_checkpoint_lsn, .release);
-                            std.debug.print("  -> Processed checkpoint at LSN {}\n", .{checkpoint_data.last_checkpoint_lsn});
                         }
                     },
                 }
@@ -483,8 +480,6 @@ pub const WAL = struct {
                     self.current_lsn.store(entry.header.timestamp, .release);
                 }
             }
-            
-            std.debug.print("WAL recovery completed. Processed {} records\n", .{records_replayed});
             
             try self.flush();
         }
@@ -589,11 +584,8 @@ pub const WAL = struct {
                 return; // Already running
             }
             
-            std.debug.print("Starting WAL checkpoint thread (interval: {}ms)\n", .{self.checkpoint_interval_ms});
-            
             self.should_stop_checkpoint_thread.store(false, .release);
-            self.checkpoint_thread = std.Thread.spawn(.{}, checkpointThreadMain, .{ self, database }) catch |err| {
-                std.debug.print("Error starting checkpoint thread: {}\n", .{err});
+            self.checkpoint_thread = std.Thread.spawn(.{}, checkpointThreadMain, .{ self, database }) catch {
                 return DatabaseError.InternalError;
             };
         }
@@ -604,7 +596,7 @@ pub const WAL = struct {
                 return; // Not running
             }
             
-            std.debug.print("Stopping WAL checkpoint thread...\n", .{});
+            logging.info("Stopping WAL checkpoint thread", null);
             
             self.should_stop_checkpoint_thread.store(true, .release);
             
@@ -613,7 +605,7 @@ pub const WAL = struct {
                 self.checkpoint_thread = null;
             }
             
-            std.debug.print("WAL checkpoint thread stopped\n", .{});
+            logging.info("WAL checkpoint thread stopped", null);
         }
         
         /// Configure checkpointing parameters
@@ -624,8 +616,6 @@ pub const WAL = struct {
             self.checkpoint_interval_ms = interval_ms;
             self.max_wal_size_bytes = max_wal_size_mb * 1024 * 1024; // Convert MB to bytes
             self.max_archived_logs = max_archived;
-            
-            std.debug.print("Checkpoint configuration updated: interval={}ms, max_wal_size={}MB, max_archived={}\n", .{ interval_ms, max_wal_size_mb, max_archived });
         }
         
         /// Checkpoint statistics structure
@@ -651,8 +641,7 @@ pub const WAL = struct {
         
         /// Get current WAL file size
         fn getCurrentWALSize(self: *const Self) u64 {
-            const stat = self.log_file.stat() catch |err| {
-                std.debug.print("Error getting WAL size: {}\n", .{err});
+            const stat = self.log_file.stat() catch {
                 return 0;
             };
             return @as(u64, @intCast(stat.size));
@@ -661,13 +650,14 @@ pub const WAL = struct {
         /// Print checkpoint statistics
         pub fn printCheckpointStats(self: *const Self) void {
             const stats = self.getCheckpointStats();
+            
             std.debug.print("Checkpoint Statistics:\n", .{});
             std.debug.print("  Checkpoints performed: {}\n", .{stats.checkpoints_performed});
             std.debug.print("  Pages written: {}\n", .{stats.pages_written});
             std.debug.print("  WAL size: {} bytes\n", .{stats.wal_size});
             std.debug.print("  Last checkpoint time: {}\n", .{stats.last_checkpoint_time});
         }
-    };
+    }; // Manager struct closing brace
 };
 
 /// Main checkpoint thread function
@@ -675,7 +665,7 @@ fn checkpointThreadMain(wal_manager: *WAL.Manager, database: *anyopaque) void {
     const Database = @import("database.zig").Database;
     const db: *Database = @ptrCast(@alignCast(database));
     
-    std.debug.print("Checkpoint thread started\n", .{});
+    logging.info("Checkpoint thread started", null);
     
     while (!wal_manager.should_stop_checkpoint_thread.load(.acquire)) {
         // Sleep for the configured interval
@@ -691,8 +681,6 @@ fn checkpointThreadMain(wal_manager: *WAL.Manager, database: *anyopaque) void {
         const should_checkpoint = current_wal_size > wal_manager.max_wal_size_bytes;
         
         if (should_checkpoint) {
-            std.debug.print("Checkpoint thread: WAL size {} bytes exceeds threshold {} bytes, performing checkpoint\n", .{ current_wal_size, wal_manager.max_wal_size_bytes });
-            
             // Perform checkpoint
             wal_manager.checkpoint_mutex.lock();
             defer wal_manager.checkpoint_mutex.unlock();
@@ -700,29 +688,26 @@ fn checkpointThreadMain(wal_manager: *WAL.Manager, database: *anyopaque) void {
             const active_tx_count = db.getActiveTransactionCount();
             
             // Write checkpoint record
-            _ = wal_manager.writeCheckpoint(@as(u32, @intCast(active_tx_count))) catch |err| {
-                std.debug.print("Checkpoint thread: Error writing checkpoint: {}\n", .{err});
+            _ = wal_manager.writeCheckpoint(@as(u32, @intCast(active_tx_count))) catch {
                 continue;
             };
             
             // Flush WAL to disk
-            wal_manager.flush() catch |err| {
-                std.debug.print("Checkpoint thread: Error flushing WAL: {}\n", .{err});
+            wal_manager.flush() catch {
                 continue;
             };
             
             // Flush database buffer pool
-            db.buffer_pool.flushAll() catch |err| {
-                std.debug.print("Checkpoint thread: Error flushing buffer pool: {}\n", .{err});
+            db.buffer_pool.flushAll() catch {
                 continue;
             };
             
-            std.debug.print("Checkpoint thread: Checkpoint completed successfully\n", .{});
+            logging.info("Checkpoint thread: Checkpoint completed successfully", null);
             
             // TODO: Consider WAL log rotation here if needed
             // This would involve creating a new WAL file and archiving the old one
         }
     }
     
-    std.debug.print("Checkpoint thread exiting\n", .{});
+    logging.info("Checkpoint thread exiting", null);
 }

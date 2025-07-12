@@ -14,38 +14,42 @@ const Threading = @import("threading.zig").Threading;
 const Transaction = @import("transaction.zig").Transaction;
 const TransactionManager = @import("transaction.zig").TransactionManager;
 const WAL = @import("wal.zig").WAL;
+const logging = @import("logging.zig");
+const types = @import("types.zig");
+const TypedValue = types.TypedValue;
+const TypedValueHelper = types.TypedValueHelper;
 
 /// Path tracking structure for efficient parent finding during splits
 const TreePath = struct {
     pages: [MAX_TREE_DEPTH]u32,
     depth: u32,
-    
+
     const MAX_TREE_DEPTH = 20; // Reasonable limit for B+ tree depth
-    
+
     pub fn init() TreePath {
         return TreePath{
             .pages = [_]u32{0} ** MAX_TREE_DEPTH,
             .depth = 0,
         };
     }
-    
+
     pub fn push(self: *TreePath, page_id: u32) void {
         if (self.depth < MAX_TREE_DEPTH) {
             self.pages[self.depth] = page_id;
             self.depth += 1;
         }
     }
-    
+
     pub fn getParent(self: *const TreePath) ?u32 {
         if (self.depth <= 1) return null; // Root or empty path
         return self.pages[self.depth - 2]; // Parent of current page
     }
-    
+
     pub fn getCurrentPage(self: *const TreePath) ?u32 {
         if (self.depth == 0) return null;
         return self.pages[self.depth - 1];
     }
-    
+
     pub fn popToParent(self: *TreePath) void {
         if (self.depth > 0) {
             self.depth -= 1;
@@ -55,7 +59,7 @@ const TreePath = struct {
 
 pub const Database = struct {
     const Self = @This();
-    
+
     file: std.fs.File,
     buffer_pool: BufferPool,
     header_page: *HeaderPage,
@@ -68,14 +72,39 @@ pub const Database = struct {
     wal_manager: WAL.Manager,
     wal_path: []u8,
     is_recovery_mode: std.atomic.Value(bool),
-    
+
     pub fn create(path: []const u8, allocator: std.mem.Allocator) DatabaseError!Self {
+        // Initialize logging if not already done
+        if (logging.getGlobalLogger() == null) {
+            const log_config = logging.LogConfig{
+                .level = .debug,
+                .output = .stderr,
+                .enable_timestamps = true,
+                .enable_colors = true,
+            };
+            logging.initGlobalLogger(allocator, log_config) catch {}; // Ignore logging init errors
+        }
+        
+        logging.info("Creating new database", null);
+        
         // Create new database file
         const file = std.fs.cwd().createFile(path, .{ .read = true, .truncate = true }) catch |err| switch (err) {
-            error.FileNotFound => return DatabaseError.FileNotFound,
-            error.AccessDenied => return DatabaseError.FileAccessDenied,
-            error.PathAlreadyExists => return DatabaseError.FileAlreadyExists,
-            else => return DatabaseError.InternalError,
+            error.FileNotFound => {
+                logging.err("Database file creation failed: file not found", null);
+                return DatabaseError.FileNotFound;
+            },
+            error.AccessDenied => {
+                logging.err("Database file creation failed: access denied", null);
+                return DatabaseError.FileAccessDenied;
+            },
+            error.PathAlreadyExists => {
+                logging.warn("Database file already exists", null);
+                return DatabaseError.FileAlreadyExists;
+            },
+            else => {
+                logging.err("Database file creation failed: internal error", null);
+                return DatabaseError.InternalError;
+            },
         };
         
         // Create WAL file path
@@ -105,14 +134,37 @@ pub const Database = struct {
         // Initialize header page
         try db.initializeHeader();
         
+        
         return db;
     }
-    
+
     pub fn open(path: []const u8, allocator: std.mem.Allocator) DatabaseError!Self {
+        // Initialize logging if not already done
+        if (logging.getGlobalLogger() == null) {
+            const log_config = logging.LogConfig{
+                .level = .debug,
+                .output = .stderr,
+                .enable_timestamps = true,
+                .enable_colors = true,
+            };
+            logging.initGlobalLogger(allocator, log_config) catch {}; // Ignore logging init errors
+        }
+        
+        logging.info("Opening existing database", null);
+        
         const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => return DatabaseError.FileNotFound,
-            error.AccessDenied => return DatabaseError.FileAccessDenied,
-            else => return DatabaseError.InternalError,
+            error.FileNotFound => {
+                logging.err("Database file not found", null);
+                return DatabaseError.FileNotFound;
+            },
+            error.AccessDenied => {
+                logging.err("Database file access denied", null);
+                return DatabaseError.FileAccessDenied;
+            },
+            else => {
+                logging.err("Database file open failed: internal error", null);
+                return DatabaseError.InternalError;
+            },
         };
         
         // Create WAL file path
@@ -143,15 +195,17 @@ pub const Database = struct {
         try db.loadHeader();
         
         // Perform WAL recovery
-        db.wal_manager.recover(@ptrCast(&db)) catch |err| {
-            std.debug.print("WAL recovery failed: {}, continuing without recovery\n", .{err});
+        db.wal_manager.recover(@ptrCast(&db)) catch {
         };
+        
         
         return db;
     }
-    
+
     pub fn close(self: *Self) void {
         if (!self.is_open.load(.acquire)) return;
+        
+        logging.info("Closing database", null);
         
         // Signal shutdown and wait for operations to complete
         self.db_lock.shutdown();
@@ -160,7 +214,8 @@ pub const Database = struct {
         self.is_open.store(false, .release);
         
         // Flush all dirty pages while file is still open
-        self.buffer_pool.flushAll() catch {};
+        self.buffer_pool.flushAll() catch {
+        };
         
         // Clean up buffer pool first (this will handle any remaining page operations)
         self.buffer_pool.deinit();
@@ -176,19 +231,21 @@ pub const Database = struct {
         
         // Close file last, after all buffer operations are complete
         self.file.close();
+        
+        logging.info("Database closed successfully", null);
     }
-    
+
     /// Update the database reference for transaction rollback callbacks
     /// This must be called after the Database struct is moved to its final location
     pub fn updateDatabaseReference(self: *Self) void {
         self.transaction_manager.setDatabaseReference(@ptrCast(self));
     }
-    
     pub fn put(self: *Self, key: []const u8, value: []const u8) DatabaseError!void {
         if (!self.db_lock.beginOperation()) return DatabaseError.DatabaseNotOpen;
         defer self.db_lock.endOperation();
         
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
+        
         
         // Use fine-grained page-level locking for concurrent write operations
         // Each B+ tree operation will acquire appropriate page locks as needed
@@ -204,40 +261,59 @@ pub const Database = struct {
         // Update key count atomically
         _ = self.key_count.fetchAdd(1, .acq_rel);
         self.header_page.key_count = self.key_count.load(.acquire);
+        
+        logging.debug("PUT operation completed successfully", null);
     }
-    
+
     pub fn get(self: *Self, key: []const u8, allocator: std.mem.Allocator) DatabaseError!?[]u8 {
         if (!self.db_lock.beginOperation()) return DatabaseError.DatabaseNotOpen;
         defer self.db_lock.endOperation();
         
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
         
+        
         if (self.header_page.root_page == 0) {
+            logging.debug("GET operation: empty database", null);
             return null; // Empty database
         }
+        const result = self.searchInBTree(key, allocator) catch |err| {
+            return err;
+        };
         
-        return try self.searchInBTree(key, allocator);
+        if (result) |_| {
+        } else {
+            logging.debug("GET operation: key not found", null);
+        }
+        
+        return result;
     }
-    
+
     pub fn delete(self: *Self, key: []const u8) DatabaseError!bool {
         if (!self.db_lock.beginOperation()) return DatabaseError.DatabaseNotOpen;
         defer self.db_lock.endOperation();
         
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
         
+        
         if (self.header_page.root_page == 0) {
+            logging.debug("DELETE operation: empty database", null);
             return false; // Empty database
         }
         
-        const deleted = try self.deleteFromBTree(key);
+        const deleted = self.deleteFromBTree(key) catch |err| {
+            return err;
+        };
+        
         if (deleted) {
             _ = self.key_count.fetchSub(1, .acq_rel);
             self.header_page.key_count = self.key_count.load(.acquire);
+            
+        } else {
+            logging.debug("DELETE operation: key not found", null);
         }
         
         return deleted;
     }
-    
     pub fn sync(self: *Self) DatabaseError!void {
         if (!self.db_lock.beginOperation()) return DatabaseError.DatabaseNotOpen;
         defer self.db_lock.endOperation();
@@ -251,11 +327,11 @@ pub const Database = struct {
             else => return DatabaseError.InternalError,
         };
     }
-    
+
     pub fn getKeyCount(self: *const Self) u64 {
         return self.key_count.load(.acquire);
     }
-    
+
     /// Begin a new transaction
     pub fn beginTransaction(self: *Self, isolation_level: Transaction.IsolationLevel) DatabaseError!u64 {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -269,7 +345,7 @@ pub const Database = struct {
         
         return transaction.id;
     }
-    
+
     /// Commit a transaction
     pub fn commitTransaction(self: *Self, tx_id: u64) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -281,7 +357,7 @@ pub const Database = struct {
         
         try self.transaction_manager.commitTransaction(tx_id);
     }
-    
+
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self, tx_id: u64) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -294,54 +370,64 @@ pub const Database = struct {
         // Perform the rollback while the database is still open
         try self.transaction_manager.abortTransaction(tx_id);
     }
-    
+
     /// Get count of active transactions
     pub fn getActiveTransactionCount(self: *Self) usize {
         return self.transaction_manager.getActiveTransactionCount();
     }
-    
+
     /// Perform manual WAL checkpoint
     pub fn checkpoint(self: *Self) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
         
         const active_count = @as(u32, @intCast(self.getActiveTransactionCount()));
-        _ = try self.wal_manager.writeCheckpoint(active_count);
+        
+        logging.info("Starting manual checkpoint", null);
+        _ = self.wal_manager.writeCheckpoint(active_count) catch |err| {
+            return err;
+        };
     }
-    
+
     /// Start automatic WAL checkpointing
     pub fn startAutoCheckpoint(self: *Self) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
         
-        try self.wal_manager.startCheckpointThread(@ptrCast(self));
+        logging.info("Starting automatic checkpoint thread", null);
+        self.wal_manager.startCheckpointThread(@ptrCast(self)) catch |err| {
+            return err;
+        };
+        
+        logging.info("Automatic checkpoint thread started successfully", null);
     }
-    
+
     /// Stop automatic WAL checkpointing
     pub fn stopAutoCheckpoint(self: *Self) void {
+        logging.info("Stopping automatic checkpoint thread", null);
         self.wal_manager.stopCheckpointThread();
+        logging.info("Automatic checkpoint thread stopped", null);
     }
-    
+
     /// Configure WAL checkpointing parameters
     pub fn configureCheckpointing(self: *Self, interval_ms: u64, max_wal_size_mb: u32, max_archived: u32) void {
         self.wal_manager.configureCheckpointing(interval_ms, max_wal_size_mb, max_archived);
     }
-    
+
     /// Get WAL checkpoint statistics
     pub fn getCheckpointStats(self: *Self) @TypeOf(self.wal_manager.getCheckpointStats()) {
         return self.wal_manager.getCheckpointStats();
     }
-    
     /// Get buffer pool statistics
     pub fn getBufferPoolStats(self: *Self) @TypeOf(self.buffer_pool.getStatistics()) {
         return self.buffer_pool.getStatistics();
     }
-    
     /// Print buffer pool statistics
     pub fn printBufferPoolStats(self: *Self) void {
         self.buffer_pool.printStatistics();
     }
-    
+
     /// Print comprehensive database statistics
     pub fn printDatabaseStats(self: *Self) void {
+        
         std.debug.print("\n=== LowkeyDB Database Statistics ===\n", .{});
         std.debug.print("Key Count: {}\n", .{self.key_count.load(.acquire)});
         std.debug.print("Page Count: {}\n", .{self.page_count.load(.acquire)});
@@ -355,14 +441,18 @@ pub const Database = struct {
         // Print WAL checkpoint stats
         self.wal_manager.printCheckpointStats();
     }
-    
+
     /// Flush WAL to disk
     pub fn flushWAL(self: *Self) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
         
-        try self.wal_manager.flush();
+        logging.debug("Flushing WAL to disk", null);
+        self.wal_manager.flush() catch |err| {
+            return err;
+        };
+        logging.debug("WAL flush completed", null);
     }
-    
+
     /// Transactional put operation
     pub fn putTransaction(self: *Self, tx_id: u64, key: []const u8, value: []const u8) DatabaseError!void {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -395,7 +485,7 @@ pub const Database = struct {
         // Perform the actual put operation
         try self.put(key, value);
     }
-    
+
     /// Transactional get operation
     pub fn getTransaction(self: *Self, tx_id: u64, key: []const u8, allocator: std.mem.Allocator) DatabaseError!?[]u8 {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -411,7 +501,7 @@ pub const Database = struct {
         // TODO: Implement isolation level specific logic
         return self.get(key, allocator);
     }
-    
+
     /// Transactional delete operation
     pub fn deleteTransaction(self: *Self, tx_id: u64, key: []const u8) DatabaseError!bool {
         if (!self.is_open.load(.acquire)) return DatabaseError.DatabaseNotOpen;
@@ -444,7 +534,7 @@ pub const Database = struct {
         
         return false; // Key doesn't exist
     }
-    
+
     fn initializeHeader(self: *Self) DatabaseError!void {
         // Create and write header page
         var header = HeaderPage.init();
@@ -462,7 +552,7 @@ pub const Database = struct {
         
         try self.buffer_pool.unpinPage(0, true);
     }
-    
+
     fn loadHeader(self: *Self) DatabaseError!void {
         // Read header page
         var header_data: [PAGE_SIZE]u8 = undefined;
@@ -482,7 +572,7 @@ pub const Database = struct {
         
         try self.buffer_pool.unpinPage(0, false);
     }
-    
+
     fn createRootPageSafe(self: *Self) DatabaseError!void {
         // Use database-level exclusive lock only for root page creation
         // This prevents race conditions when multiple threads try to create root simultaneously
@@ -509,7 +599,7 @@ pub const Database = struct {
         // Unpin the page as dirty since we modified it
         self.buffer_pool.unpinPageExclusive(page_id, true);
     }
-    
+
     fn createRootPage(self: *Self) DatabaseError!void {
         // Allocate new page for root
         const page_id = try self.allocateNewPage();
@@ -526,7 +616,7 @@ pub const Database = struct {
         // Unpin the page as dirty since we modified it
         self.buffer_pool.unpinPageExclusive(page_id, true);
     }
-    
+
     fn allocateNewPage(self: *Self) DatabaseError!u32 {
         // Atomically increment page count
         const page_id = self.page_count.fetchAdd(1, .acq_rel);
@@ -542,13 +632,13 @@ pub const Database = struct {
         
         return page_id;
     }
-    
+
     /// Find the leaf page that should contain the given key
     fn findLeafPage(self: *Self, key: []const u8) DatabaseError!u32 {
         var path = TreePath.init();
         return self.findLeafPageWithPath(key, &path);
     }
-    
+
     /// Find the leaf page and track the path for efficient parent finding
     fn findLeafPageWithPath(self: *Self, key: []const u8, path: *TreePath) DatabaseError!u32 {
         var current_page_id = self.header_page.root_page;
@@ -570,7 +660,7 @@ pub const Database = struct {
             current_page_id = internal_page.findChild(key);
         }
     }
-    
+
     fn insertIntoBTree(self: *Self, key: []const u8, value: []const u8) DatabaseError!void {
         // Use path tracking for efficient multi-level B+ tree operations
         var path = TreePath.init();
@@ -589,7 +679,7 @@ pub const Database = struct {
             self.buffer_pool.unpinPageExclusive(leaf_page_id, true);
         }
     }
-    
+
     /// Handle leaf page splitting and insertion using already-pinned page pointer
     fn splitLeafAndInsertWithPointer(self: *Self, leaf_page_id: u32, leaf_page: *BTreeLeafPage, key: []const u8, value: []const u8) DatabaseError!void {
         // Page is already pinned exclusively by caller, no need to pin again
@@ -624,8 +714,8 @@ pub const Database = struct {
         // Handle the promotion key - insert into parent or create new root
         try self.handlePromotion(split_result, leaf_page_id);
     }
-    
-    
+
+
     /// Handle leaf page splitting and insertion with path tracking (optimized)
     fn splitLeafAndInsertWithPath(self: *Self, leaf_page_id: u32, leaf_page: *BTreeLeafPage, key: []const u8, value: []const u8, path: *TreePath) DatabaseError!void {
         // Page is already pinned exclusively by caller, no need to re-pin
@@ -660,7 +750,7 @@ pub const Database = struct {
         // Handle the promotion key using path information (optimized)
         try self.handlePromotionWithPath(split_result, leaf_page_id, path);
     }
-    
+
     /// Handle promotion of a key to parent level with path tracking (optimized)
     fn handlePromotionWithPath(self: *Self, split_result: SplitResult, left_page_id: u32, path: *TreePath) DatabaseError!void {
         // Get parent page ID from path instead of expensive search
@@ -674,7 +764,7 @@ pub const Database = struct {
             try self.insertIntoInternalWithPath(parent_page_id.?, split_result, path);
         }
     }
-    
+
     /// Handle promotion of a key to parent level (or create new root) - legacy version
     fn handlePromotion(self: *Self, split_result: SplitResult, left_page_id: u32) DatabaseError!void {
         // Check if we need to create a new root (root was a leaf page)
@@ -692,7 +782,7 @@ pub const Database = struct {
             try self.insertIntoInternal(root_page_id, split_result);
         }
     }
-    
+
     /// Create a new internal root when the original root (leaf) splits
     fn createNewRoot(self: *Self, split_result: SplitResult, left_page_id: u32) DatabaseError!void {
         // Allocate new page for the new root
@@ -716,7 +806,7 @@ pub const Database = struct {
         // Free the promotion key
         self.allocator.free(split_result.promotion_key);
     }
-    
+
     /// Insert a promotion key into an existing internal page with path tracking (optimized)
     fn insertIntoInternalWithPath(self: *Self, page_id: u32, split_result: SplitResult, path: *TreePath) DatabaseError!void {
         const page_ptr = try self.buffer_pool.getPageExclusive(page_id);
@@ -739,7 +829,7 @@ pub const Database = struct {
             self.allocator.free(split_result.promotion_key);
         }
     }
-    
+
     /// Insert a promotion key into an existing internal page structure - legacy version
     fn insertIntoInternal(self: *Self, page_id: u32, split_result: SplitResult) DatabaseError!void {
         const page_ptr = try self.buffer_pool.getPageExclusive(page_id);
@@ -759,7 +849,7 @@ pub const Database = struct {
             self.allocator.free(split_result.promotion_key);
         }
     }
-    
+
     /// Handle internal page splitting with path tracking (optimized)
     fn splitInternalAndInsertWithPath(self: *Self, page_id: u32, split_result: SplitResult, path: *TreePath) DatabaseError!void {
         // Get the internal page that needs to be split
@@ -797,7 +887,7 @@ pub const Database = struct {
         // Use path instead of expensive recursive search
         try self.handlePromotionWithPath(internal_split_result, page_id, path);
     }
-    
+
     /// Handle internal page splitting (recursive case) - legacy version
     fn splitInternalAndInsert(self: *Self, page_id: u32, split_result: SplitResult) DatabaseError!void {
         // Get the internal page that needs to be split
@@ -838,7 +928,7 @@ pub const Database = struct {
         // This is the recursive part - we need to handle the new promotion
         try self.handlePromotionRecursive(internal_split_result, page_id);
     }
-    
+
     /// Handle promotion recursively - works at any level of the tree
     fn handlePromotionRecursive(self: *Self, split_result: SplitResult, left_page_id: u32) DatabaseError!void {
         // Find the parent of the page that just split
@@ -864,7 +954,7 @@ pub const Database = struct {
             }
         }
     }
-    
+
     /// Find the parent page of a given page by traversing from root
     /// Returns 0 if the page is the root (no parent)
     fn findParentPage(self: *Self, child_page_id: u32, key_hint: []const u8) DatabaseError!u32 {
@@ -878,12 +968,12 @@ pub const Database = struct {
         // Start traversal from root
         return self.findParentPageRecursive(root_page_id, child_page_id, key_hint);
     }
-    
+
     /// Recursively search for the parent of a given page with depth limit
     fn findParentPageRecursive(self: *Self, current_page_id: u32, target_child_id: u32, key_hint: []const u8) DatabaseError!u32 {
         return self.findParentPageRecursiveWithDepth(current_page_id, target_child_id, key_hint, 0);
     }
-    
+
     /// Internal recursive function with depth tracking to prevent infinite recursion
     fn findParentPageRecursiveWithDepth(self: *Self, current_page_id: u32, target_child_id: u32, key_hint: []const u8, depth: u32) DatabaseError!u32 {
         // Prevent infinite recursion - B+ trees shouldn't be deeper than ~10 levels for reasonable datasets
@@ -922,7 +1012,7 @@ pub const Database = struct {
         // Recursively search in the appropriate subtree
         return self.findParentPageRecursiveWithDepth(next_child_id, target_child_id, key_hint, depth + 1);
     }
-    
+
     fn searchInBTree(self: *Self, key: []const u8, allocator: std.mem.Allocator) DatabaseError!?[]u8 {
         // Find the correct leaf page
         const leaf_page_id = try self.findLeafPage(key);
@@ -941,7 +1031,7 @@ pub const Database = struct {
         
         return null;
     }
-    
+
     fn deleteFromBTree(self: *Self, key: []const u8) DatabaseError!bool {
         // Find the correct leaf page
         const leaf_page_id = try self.findLeafPage(key);
@@ -975,7 +1065,7 @@ pub const Database = struct {
         
         return true;
     }
-    
+
     /// Handle rebalancing after a deletion causes underflow
     fn rebalanceAfterDeletion(self: *Self, page_id: u32, deleted_key: []const u8) DatabaseError!void {
         // Find the parent and sibling pages
@@ -1045,14 +1135,14 @@ pub const Database = struct {
         self.buffer_pool.unpinPageExclusive(parent_page_id, false);
         return DatabaseError.InternalError;
     }
-    
+
     /// Handle the case when root page becomes empty
     fn handleEmptyRoot(self: *Self) DatabaseError!void {
         _ = self; // TODO: Implement root handling
         // For now, just keep the empty root
         // TODO: In a multi-level tree, we should make a child the new root
     }
-    
+
     /// Try to borrow a key from the left sibling
     fn tryBorrowFromLeftSibling(self: *Self, page_id: u32, left_sibling_id: u32, parent_page_id: u32, parent_key_index: usize) DatabaseError!bool {
         // Get both pages
@@ -1105,7 +1195,7 @@ pub const Database = struct {
         
         return true;
     }
-    
+
     /// Try to borrow a key from the right sibling  
     fn tryBorrowFromRightSibling(self: *Self, page_id: u32, right_sibling_id: u32, parent_page_id: u32, parent_key_index: usize) DatabaseError!bool {
         // Get both pages
@@ -1153,7 +1243,7 @@ pub const Database = struct {
         
         return true;
     }
-    
+
     /// Try to merge with left sibling
     fn tryMergeWithLeftSibling(self: *Self, page_id: u32, left_sibling_id: u32, parent_page_id: u32, parent_key_index: usize) DatabaseError!bool {
         // Get both pages
@@ -1195,7 +1285,7 @@ pub const Database = struct {
         
         return true;
     }
-    
+
     /// Try to merge with right sibling
     fn tryMergeWithRightSibling(self: *Self, page_id: u32, right_sibling_id: u32, parent_page_id: u32, parent_key_index: usize) DatabaseError!bool {
         // Get both pages
@@ -1237,7 +1327,7 @@ pub const Database = struct {
         
         return true;
     }
-    
+
     /// Remove a key from an internal node and update child pointers
     fn removeKeyFromInternalNode(self: *Self, page_id: u32, key_index: usize, removed_child_id: u32) DatabaseError!void {
         const page_ptr = try self.buffer_pool.getPageExclusive(page_id);
@@ -1278,7 +1368,7 @@ pub const Database = struct {
             self.buffer_pool.unpinPageExclusive(page_id, true);
         }
     }
-    
+
     /// Reduce tree height when root becomes empty
     fn reduceTreeHeight(self: *Self) DatabaseError!void {
         const root_page_id = self.header_page.root_page;
@@ -1311,18 +1401,15 @@ pub const Database = struct {
         // Decrement page count since we're effectively removing the old root
         _ = self.page_count.fetchSub(1, .monotonic);
     }
-    
+
     /// Validate the B+ tree structure for debugging
     pub fn validateBTreeStructure(self: *Self) DatabaseError!void {
         const root_page_id = self.header_page.root_page;
-        std.debug.print("Validating B+ tree structure starting from root page {}...\n", .{root_page_id});
         
         var total_keys: u32 = 0;
         try self.validateBTreePage(root_page_id, 0, &total_keys);
-        
-        std.debug.print("B+ tree validation complete. Total keys found: {}\n", .{total_keys});
     }
-    
+
     /// Recursively validate a B+ tree page
     fn validateBTreePage(self: *Self, page_id: u32, depth: u32, total_keys: *u32) DatabaseError!void {
         if (depth > 20) { // Prevent infinite recursion
@@ -1373,21 +1460,17 @@ pub const Database = struct {
             },
         }
     }
-};
 
 /// Rollback callback function for transaction manager
 fn performRollback(transaction: *Transaction, database: *anyopaque, allocator: std.mem.Allocator) DatabaseError!void {
     // Cast the database pointer back to the correct type
     const db: *Database = @ptrCast(@alignCast(database));
-    
+
     // Check if database is still open
     if (!db.is_open.load(.acquire)) {
-        std.debug.print("Database closed during rollback for transaction {}\n", .{transaction.id});
         return;
     }
-    
-    std.debug.print("Starting rollback for transaction {} with {} operations\n", .{transaction.id, transaction.undo_log.items.len});
-    
+
     // Process undo log in reverse order (LIFO) to undo operations
     var i = transaction.undo_log.items.len;
     while (i > 0) {
@@ -1401,9 +1484,7 @@ fn performRollback(transaction: *Transaction, database: *anyopaque, allocator: s
                 // 2. Restore the old value if it was an update
                 if (entry.old_value == null) {
                     // This was a new insertion, delete the key
-                    std.debug.print("Rollback: Deleting inserted key '{s}'\n", .{entry.key});
                     const deleted = db.deleteFromBTree(entry.key) catch |err| {
-                        std.debug.print("Rollback error: Failed to delete key '{s}': {}\n", .{entry.key, err});
                         return err;
                     };
                     if (deleted) {
@@ -1413,9 +1494,7 @@ fn performRollback(transaction: *Transaction, database: *anyopaque, allocator: s
                     }
                 } else {
                     // This was an update, restore old value
-                    std.debug.print("Rollback: Restoring key '{s}' to old value\n", .{entry.key});
                     db.insertIntoBTree(entry.key, entry.old_value.?) catch |err| {
-                        std.debug.print("Rollback error: Failed to restore key '{s}': {}\n", .{entry.key, err});
                         return err;
                     };
                 }
@@ -1423,9 +1502,7 @@ fn performRollback(transaction: *Transaction, database: *anyopaque, allocator: s
             .delete => {
                 // For delete operations, restore the deleted key-value pair
                 if (entry.old_value) |old_value| {
-                    std.debug.print("Rollback: Restoring deleted key '{s}'\n", .{entry.key});
                     db.insertIntoBTree(entry.key, old_value) catch |err| {
-                        std.debug.print("Rollback error: Failed to restore deleted key '{s}': {}\n", .{entry.key, err});
                         return err;
                     };
                     // Increment key count since we restored a key
@@ -1436,18 +1513,166 @@ fn performRollback(transaction: *Transaction, database: *anyopaque, allocator: s
             .update => {
                 // For update operations, restore the old value
                 if (entry.old_value) |old_value| {
-                    std.debug.print("Rollback: Restoring updated key '{s}' to old value\n", .{entry.key});
                     db.insertIntoBTree(entry.key, old_value) catch |err| {
-                        std.debug.print("Rollback error: Failed to restore updated key '{s}': {}\n", .{entry.key, err});
                         return err;
                     };
                 }
             },
         }
     }
-    
+
     // Suppress unused parameter warning
     _ = allocator;
-    
-    std.debug.print("Transaction {} successfully rolled back with {} operations\n", .{transaction.id, transaction.undo_log.items.len});
 }
+
+    // =============================================================================
+    // TYPED VALUE API - Modern type-safe interface
+    // =============================================================================
+    
+    /// Put a typed value into the database
+    pub fn putTyped(self: *Self, key: []const u8, value: TypedValue) DatabaseError!void {
+        const value_bytes = value.toBytes(self.allocator) catch return DatabaseError.InternalError;
+        defer self.allocator.free(value_bytes);
+        
+        return self.put(key, value_bytes);
+    }
+    
+    /// Get a typed value from the database
+    pub fn getTyped(self: *Self, key: []const u8) DatabaseError!?TypedValue {
+        const raw_value = try self.get(key, self.allocator) orelse return null;
+        defer self.allocator.free(raw_value);
+        
+        return TypedValue.fromBytes(raw_value, self.allocator) catch return DatabaseError.CorruptedData;
+    }
+    
+    /// Put a typed value in a transaction
+    pub fn putTypedTransaction(self: *Self, tx_id: u64, key: []const u8, value: TypedValue) DatabaseError!void {
+        const value_bytes = value.toBytes(self.allocator) catch return DatabaseError.InternalError;
+        defer self.allocator.free(value_bytes);
+        
+        return self.putTransaction(tx_id, key, value_bytes);
+    }
+    
+    /// Get a typed value in a transaction  
+    pub fn getTypedTransaction(self: *Self, tx_id: u64, key: []const u8) DatabaseError!?TypedValue {
+        const raw_value = try self.getTransaction(tx_id, key, self.allocator) orelse return null;
+        defer self.allocator.free(raw_value);
+        
+        return TypedValue.fromBytes(raw_value, self.allocator) catch return DatabaseError.CorruptedData;
+    }
+    
+    // Type-specific convenience methods
+    
+    /// Put a string value
+    pub fn putString(self: *Self, key: []const u8, value: []const u8) DatabaseError!void {
+        return self.putTyped(key, TypedValueHelper.string(value));
+    }
+    
+    /// Get a string value (returns error if not a string)
+    pub fn getString(self: *Self, key: []const u8) DatabaseError!?[]u8 {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .string => |str| try self.allocator.dupe(u8, str),
+            else => DatabaseError.TypeMismatch,
+        };
+    }
+    
+    /// Put an integer value
+    pub fn putInteger(self: *Self, key: []const u8, value: i64) DatabaseError!void {
+        return self.putTyped(key, TypedValueHelper.integer(value));
+    }
+    
+    /// Get an integer value (returns error if not an integer)
+    pub fn getInteger(self: *Self, key: []const u8) DatabaseError!?i64 {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .integer => |int| int,
+            else => DatabaseError.TypeMismatch,
+        };
+    }
+    
+    /// Put a float value
+    pub fn putFloat(self: *Self, key: []const u8, value: f64) DatabaseError!void {
+        return self.putTyped(key, TypedValueHelper.float(value));
+    }
+    
+    /// Get a float value (returns error if not a float)
+    pub fn getFloat(self: *Self, key: []const u8) DatabaseError!?f64 {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .float => |float| float,
+            else => DatabaseError.TypeMismatch,
+        };
+    }
+    
+    /// Put a boolean value
+    pub fn putBoolean(self: *Self, key: []const u8, value: bool) DatabaseError!void {
+        return self.putTyped(key, TypedValueHelper.boolean(value));
+    }
+    
+    /// Get a boolean value (returns error if not a boolean)
+    pub fn getBoolean(self: *Self, key: []const u8) DatabaseError!?bool {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .boolean => |boolean| boolean,
+            else => DatabaseError.TypeMismatch,
+        };
+    }
+    
+    /// Put a JSON value from a string
+    pub fn putJSON(self: *Self, key: []const u8, json_string: []const u8) DatabaseError!void {
+        const json_value = TypedValueHelper.jsonFromString(json_string, self.allocator) catch return DatabaseError.InvalidInput;
+        defer json_value.deinit(self.allocator);
+        
+        return self.putTyped(key, json_value);
+    }
+    
+    /// Get a JSON value as a string
+    pub fn getJSON(self: *Self, key: []const u8) DatabaseError!?[]u8 {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .json => |json| blk: {
+                var string = std.ArrayList(u8).init(self.allocator);
+                std.json.stringify(json, .{}, string.writer()) catch return DatabaseError.InternalError;
+                break :blk try string.toOwnedSlice();
+            },
+            else => DatabaseError.TypeMismatch,
+        };
+    }
+    
+    /// Put a null value
+    pub fn putNull(self: *Self, key: []const u8) DatabaseError!void {
+        return self.putTyped(key, TypedValueHelper.@"null"());
+    }
+    
+    /// Check if a value is null
+    pub fn isNull(self: *Self, key: []const u8) DatabaseError!?bool {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return switch (typed_value) {
+            .null => true,
+            else => false,
+        };
+    }
+    
+    /// Get the type of a stored value
+    pub fn getValueType(self: *Self, key: []const u8) DatabaseError!?types.ValueType {
+        const typed_value = try self.getTyped(key) orelse return null;
+        defer typed_value.deinit(self.allocator);
+        
+        return typed_value.getType();
+    }
+
+};
+

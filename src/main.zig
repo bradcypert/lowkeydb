@@ -1,5 +1,6 @@
 const std = @import("std");
 const lowkeydb = @import("root.zig");
+const logging = @import("logging.zig");
 
 const Command = enum {
     get,
@@ -29,6 +30,15 @@ pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    
+    // Initialize structured logging for CLI
+    const log_config = logging.LogConfig{
+        .level = .info,
+        .output = .stderr,
+        .enable_timestamps = false, // CLI doesn't need timestamps
+        .enable_colors = true,
+    };
+    try logging.initGlobalLogger(allocator, log_config);
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -103,6 +113,7 @@ fn processCommand(input: []const u8, db: *lowkeydb.Database, allocator: std.mem.
                 defer allocator.free(v);
                 try writer.print("Value: {s}\n", .{v});
             } else {
+                logging.info("GET operation: key not found", null);
                 try writer.print("Key not found\n", .{});
             }
         },
@@ -138,6 +149,7 @@ fn processCommand(input: []const u8, db: *lowkeydb.Database, allocator: std.mem.
             if (deleted) {
                 try writer.print("Key deleted\n", .{});
             } else {
+                logging.info("DELETE operation: key not found", null);
                 try writer.print("Key not found\n", .{});
             }
         },

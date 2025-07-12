@@ -18,8 +18,8 @@ pub const Threading = struct {
                 .readers = std.atomic.Value(u32).init(0),
                 .writer = std.atomic.Value(bool).init(false),
             };
-        }
         
+        }
         pub fn lockShared(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();

@@ -1,20 +1,18 @@
 const std = @import("std");
 const Page = @import("page.zig").Page;
 const DatabaseError = @import("../error.zig").DatabaseError;
-const Threading = @import("../threading.zig").Threading;
 const PAGE_SIZE = @import("page.zig").PAGE_SIZE;
 
-/// LRU node for tracking page access order
+/// Simple LRU node for tracking page access order
 const LRUNode = struct {
     page_id: u32,
     page_ptr: *Page,
     prev: ?*LRUNode,
     next: ?*LRUNode,
-    last_access_time: u64,
     access_count: u32,
 };
 
-/// LRU list for efficient eviction candidate selection
+/// Simple LRU list implementation without internal synchronization
 const LRUList = struct {
     const Self = @This();
     
@@ -39,6 +37,9 @@ const LRUList = struct {
             self.allocator.destroy(node);
             current = next;
         }
+        self.head = null;
+        self.tail = null;
+        self.count = 0;
     }
     
     /// Add a new node to the front (most recently used)
@@ -61,10 +62,29 @@ const LRUList = struct {
         if (node == self.head) return; // Already at front
         
         // Remove from current position
-        self.removeNode(node);
+        if (node.prev) |prev| {
+            prev.next = node.next;
+        } else {
+            self.head = node.next;
+        }
+        
+        if (node.next) |next| {
+            next.prev = node.prev;
+        } else {
+            self.tail = node.prev;
+        }
         
         // Add to front
-        self.addToFront(node);
+        node.prev = null;
+        node.next = self.head;
+        
+        if (self.head) |head| {
+            head.prev = node;
+        } else {
+            self.tail = node;
+        }
+        
+        self.head = node;
     }
     
     /// Remove node from list
@@ -90,23 +110,24 @@ const LRUList = struct {
     }
 };
 
+/// Simplified buffer pool with single mutex design
 pub const BufferPool = struct {
     const Self = @This();
     
-    pages: Threading.ConcurrentPageMap,
-    free_pages: std.ArrayList(*Page),
-    free_pages_mutex: std.Thread.Mutex,
-    capacity: usize,
-    allocator: std.mem.Allocator,
-    file: ?std.fs.File, // Optional file for reading pages
-    buffer_mutex: std.Thread.Mutex, // Protects overall buffer pool operations
-    
-    // LRU tracking
+    // Core data structures
+    pages: std.HashMap(u32, *Page, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage),
     lru_list: LRUList,
     lru_map: std.HashMap(u32, *LRUNode, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage),
-    lru_mutex: std.Thread.Mutex,
     
-    // Statistics
+    // Configuration
+    capacity: usize,
+    allocator: std.mem.Allocator,
+    file: ?std.fs.File,
+    
+    // Single mutex for all operations - prevents deadlocks
+    mutex: std.Thread.Mutex,
+    
+    // Statistics (atomic for lock-free reads)
     cache_hits: std.atomic.Value(u64),
     cache_misses: std.atomic.Value(u64),
     evictions: std.atomic.Value(u64),
@@ -114,16 +135,13 @@ pub const BufferPool = struct {
     
     pub fn init(allocator: std.mem.Allocator, capacity: usize) Self {
         return Self{
-            .pages = Threading.ConcurrentPageMap.init(allocator),
-            .free_pages = std.ArrayList(*Page).init(allocator),
-            .free_pages_mutex = std.Thread.Mutex{},
+            .pages = std.HashMap(u32, *Page, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage).init(allocator),
+            .lru_list = LRUList.init(allocator),
+            .lru_map = std.HashMap(u32, *LRUNode, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage).init(allocator),
             .capacity = capacity,
             .allocator = allocator,
             .file = null,
-            .buffer_mutex = std.Thread.Mutex{},
-            .lru_list = LRUList.init(allocator),
-            .lru_map = std.HashMap(u32, *LRUNode, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage).init(allocator),
-            .lru_mutex = std.Thread.Mutex{},
+            .mutex = std.Thread.Mutex{},
             .cache_hits = std.atomic.Value(u64).init(0),
             .cache_misses = std.atomic.Value(u64).init(0),
             .evictions = std.atomic.Value(u64).init(0),
@@ -132,154 +150,129 @@ pub const BufferPool = struct {
     }
     
     pub fn setFile(self: *Self, file: std.fs.File) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.file = file;
     }
     
     pub fn deinit(self: *Self) void {
-        // Lock to prevent concurrent access during cleanup
-        self.buffer_mutex.lock();
-        defer self.buffer_mutex.unlock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
         
         // Clean up LRU tracking
-        self.lru_mutex.lock();
         self.lru_list.deinit();
         self.lru_map.deinit();
-        self.lru_mutex.unlock();
         
         // Free all pages
-        self.pages.lockForIteration();
         var iter = self.pages.iterator();
         while (iter.next()) |entry| {
             self.allocator.destroy(entry.value_ptr.*);
         }
-        self.pages.unlockAfterIteration();
         self.pages.deinit();
-        
-        // Free any remaining pages in free_pages list
-        self.free_pages_mutex.lock();
-        for (self.free_pages.items) |page| {
-            self.allocator.destroy(page);
-        }
-        self.free_pages.deinit();
-        self.free_pages_mutex.unlock();
     }
     
     /// Get page for shared (read) access
     pub fn getPageShared(self: *Self, page_id: u32) DatabaseError!*Page {
-        // First try to find existing page
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        
+        // Check if page is already in buffer
         if (self.pages.get(page_id)) |page| {
+            // Update LRU on cache hit
+            if (self.lru_map.get(page_id)) |node| {
+                node.access_count += 1;
+                self.lru_list.moveToFront(node);
+            }
+            
             page.pinShared();
-            // Update LRU tracking for cache hit
-            self.updateLRUAccess(page_id, page);
             _ = self.cache_hits.fetchAdd(1, .monotonic);
             return page;
         }
         
-        // Page not in buffer - cache miss
+        // Cache miss - need to load page
         _ = self.cache_misses.fetchAdd(1, .monotonic);
         
-        // Need to allocate/load with exclusive access
-        self.buffer_mutex.lock();
-        defer self.buffer_mutex.unlock();
-        
-        // Double-check after acquiring lock (another thread might have loaded it)
-        if (self.pages.get(page_id)) |page| {
-            page.pinShared();
-            self.updateLRUAccess(page_id, page);
-            return page;
+        // Check if we need to evict
+        if (self.pages.count() >= self.capacity) {
+            try self.evictPageInternal();
         }
         
-        // Page still not found, allocate new one
-        const page = try self.allocatePage(page_id);
+        // Allocate and initialize new page
+        const page = try self.allocator.create(Page);
+        page.* = Page.init(page_id);
         
-        // Initialize page data
+        // Load from file if available
         if (self.file) |*file| {
-            self.readPageFromFile(file, page_id, page) catch |err| switch (err) {
-                error.FileNotOpen => {
-                    // File is closed/invalid, just initialize empty page
-                    page.* = Page.init(page_id);
-                },
-                else => {
-                    // Other errors (like reading beyond EOF for new pages)
-                    page.* = Page.init(page_id);
-                },
+            self.readPageFromFile(file, page_id, page) catch {
+                // If read fails, just use empty page
+                page.* = Page.init(page_id);
             };
-        } else {
-            page.* = Page.init(page_id);
         }
         
-        // Pin for shared access before adding to map
+        // Pin page and add to structures
         page.pinShared();
-        
         try self.pages.put(page_id, page);
-        
-        // Add to LRU tracking
-        self.addToLRUTracking(page_id, page) catch |err| {
-            // If LRU tracking fails, continue without it
-            std.debug.print("Warning: Failed to add page {} to LRU tracking: {}\n", .{ page_id, err });
-        };
+        try self.addToLRUInternal(page_id, page);
         
         return page;
     }
     
     /// Get page for exclusive (write) access
     pub fn getPageExclusive(self: *Self, page_id: u32) DatabaseError!*Page {
-        // Always acquire buffer mutex for exclusive access to ensure atomicity
-        self.buffer_mutex.lock();
-        defer self.buffer_mutex.unlock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
         
         // Check if page is already in buffer
         if (self.pages.get(page_id)) |page| {
+            // Update LRU on cache hit
+            if (self.lru_map.get(page_id)) |node| {
+                node.access_count += 1;
+                self.lru_list.moveToFront(node);
+            }
+            
             page.pinExclusive();
-            // Update LRU tracking for cache hit
-            self.updateLRUAccess(page_id, page);
             _ = self.cache_hits.fetchAdd(1, .monotonic);
             return page;
         }
         
-        // Page not in buffer - cache miss
+        // Cache miss - need to load page
         _ = self.cache_misses.fetchAdd(1, .monotonic);
         
-        // Allocate new page
-        const page = try self.allocatePage(page_id);
-        
-        // Initialize page data
-        if (self.file) |*file| {
-            self.readPageFromFile(file, page_id, page) catch |err| switch (err) {
-                error.FileNotOpen => {
-                    // File is closed/invalid, just initialize empty page
-                    page.* = Page.init(page_id);
-                },
-                else => {
-                    // Other errors (like reading beyond EOF for new pages)
-                    page.* = Page.init(page_id);
-                },
-            };
-        } else {
-            page.* = Page.init(page_id);
+        // Check if we need to evict
+        if (self.pages.count() >= self.capacity) {
+            try self.evictPageInternal();
         }
         
-        // Pin for exclusive access before adding to map
+        // Allocate and initialize new page
+        const page = try self.allocator.create(Page);
+        page.* = Page.init(page_id);
+        
+        // Load from file if available
+        if (self.file) |*file| {
+            self.readPageFromFile(file, page_id, page) catch {
+                // If read fails, just use empty page
+                page.* = Page.init(page_id);
+            };
+        }
+        
+        // Pin page and add to structures
         page.pinExclusive();
-        
         try self.pages.put(page_id, page);
-        
-        // Add to LRU tracking
-        self.addToLRUTracking(page_id, page) catch |err| {
-            // If LRU tracking fails, continue without it
-            std.debug.print("Warning: Failed to add page {} to LRU tracking: {}\n", .{ page_id, err });
-        };
+        try self.addToLRUInternal(page_id, page);
         
         return page;
     }
     
-    /// Legacy method - defaults to shared access for compatibility
+    /// Legacy method - defaults to shared access
     pub fn getPage(self: *Self, page_id: u32) DatabaseError!*Page {
         return self.getPageShared(page_id);
     }
     
     /// Unpin page after shared access
     pub fn unpinPageShared(self: *Self, page_id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        
         if (self.pages.get(page_id)) |page| {
             page.unpinShared();
         }
@@ -287,12 +280,15 @@ pub const BufferPool = struct {
     
     /// Unpin page after exclusive access
     pub fn unpinPageExclusive(self: *Self, page_id: u32, is_dirty: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        
         if (self.pages.get(page_id)) |page| {
             page.unpinExclusive(is_dirty);
         }
     }
     
-    /// Legacy method - assumes shared access for compatibility
+    /// Legacy method
     pub fn unpinPage(self: *Self, page_id: u32, is_dirty: bool) DatabaseError!void {
         if (is_dirty) {
             self.unpinPageExclusive(page_id, true);
@@ -301,148 +297,70 @@ pub const BufferPool = struct {
         }
     }
     
+    /// Flush a specific page
     pub fn flushPage(self: *Self, page_id: u32) DatabaseError!void {
-        const page = self.pages.get(page_id) orelse return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         
-        if (page.isDirtyAtomic()) {
-            try self.writePageToFile(page);
-            _ = self.write_backs.fetchAdd(1, .monotonic);
-        }
-    }
-    
-    pub fn flushAll(self: *Self) DatabaseError!void {
-        self.pages.lockForIteration();
-        defer self.pages.unlockAfterIteration();
-        
-        var iter = self.pages.iterator();
-        while (iter.next()) |entry| {
-            const page = entry.value_ptr.*;
+        if (self.pages.get(page_id)) |page| {
             if (page.isDirtyAtomic()) {
-                try self.writePageToFile(page);
+                try self.writePageToFileInternal(page);
                 _ = self.write_backs.fetchAdd(1, .monotonic);
             }
         }
     }
     
-    fn allocatePage(self: *Self, page_id: u32) DatabaseError!*Page {
-        // Try to reuse a page from free list
-        self.free_pages_mutex.lock();
-        if (self.free_pages.items.len > 0) {
-            const page = self.free_pages.orderedRemove(self.free_pages.items.len - 1);
-            self.free_pages_mutex.unlock();
-            page.* = Page.init(page_id);
-            return page;
-        }
-        self.free_pages_mutex.unlock();
+    /// Flush all dirty pages
+    pub fn flushAll(self: *Self) DatabaseError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         
-        // If we're at capacity, evict a page
-        if (self.pages.count() >= self.capacity) {
-            try self.evictPage();
+        var iter = self.pages.iterator();
+        while (iter.next()) |entry| {
+            const page = entry.value_ptr.*;
+            if (page.isDirtyAtomic()) {
+                try self.writePageToFileInternal(page);
+                _ = self.write_backs.fetchAdd(1, .monotonic);
+            }
         }
-        
-        // Allocate new page
-        const page = try self.allocator.create(Page);
-        page.* = Page.init(page_id);
-        return page;
     }
     
-    fn evictPage(self: *Self) DatabaseError!void {
-        // Find LRU candidate for eviction
-        self.lru_mutex.lock();
-        const lru_node = self.lru_list.getLRU();
+    /// Internal eviction - must be called with mutex held
+    fn evictPageInternal(self: *Self) DatabaseError!void {
+        // Find LRU candidate
+        var victim_node = self.lru_list.getLRU();
         
-        if (lru_node == null) {
-            self.lru_mutex.unlock();
-            return DatabaseError.OutOfMemory; // No pages to evict
-        }
-        
-        const victim_node = lru_node.?;
-        const victim_page_id = victim_node.page_id;
-        const victim_page = victim_node.page_ptr;
-        
-        // Check if page is pinned (cannot evict pinned pages)
-        if (victim_page.lock.pin_count.load(.acquire) > 0) {
-            self.lru_mutex.unlock();
-            // Try to find another victim by scanning LRU list
-            return self.evictUnpinnedPage();
-        }
-        
-        // Remove from LRU tracking
-        self.lru_list.removeNode(victim_node);
-        _ = self.lru_map.remove(victim_page_id);
-        self.allocator.destroy(victim_node);
-        self.lru_mutex.unlock();
-        
-        // Write dirty page to disk if needed
-        if (victim_page.isDirtyAtomic()) {
-            try self.writePageToFile(victim_page);
-            _ = self.write_backs.fetchAdd(1, .monotonic);
-        }
-        
-        // Remove from page map
-        _ = self.pages.remove(victim_page_id);
-        
-        // Add to free list for reuse
-        self.free_pages_mutex.lock();
-        try self.free_pages.append(victim_page);
-        self.free_pages_mutex.unlock();
-        
-        _ = self.evictions.fetchAdd(1, .monotonic);
-        
-        std.debug.print("Evicted page {} (dirty: {})\n", .{ victim_page_id, victim_page.isDirtyAtomic() });
-    }
-    
-    /// Try to find and evict an unpinned page when primary LRU candidate is pinned
-    fn evictUnpinnedPage(self: *Self) DatabaseError!void {
-        self.lru_mutex.lock();
-        defer self.lru_mutex.unlock();
-        
-        // Scan from tail (LRU) towards head looking for unpinned page
-        var current = self.lru_list.tail;
+        // Scan for unpinned page
         var attempts: u32 = 0;
-        const max_attempts = 10; // Limit search to avoid long delays
-        
-        while (current != null and attempts < max_attempts) {
-            const node = current.?;
+        while (victim_node != null and attempts < 10) {
+            const node = victim_node.?;
             const page = node.page_ptr;
             
+            // Check if page is unpinned
             if (page.lock.pin_count.load(.acquire) == 0) {
-                // Found unpinned page, evict it
+                // Found eviction candidate
                 const page_id = node.page_id;
                 
-                // Write dirty page to disk if needed
+                // Write to disk if dirty
                 if (page.isDirtyAtomic()) {
-                    // Temporarily unlock LRU mutex for disk I/O
-                    self.lru_mutex.unlock();
-                    self.writePageToFile(page) catch |err| {
-                        self.lru_mutex.lock();
-                        return err;
-                    };
+                    try self.writePageToFileInternal(page);
                     _ = self.write_backs.fetchAdd(1, .monotonic);
-                    self.lru_mutex.lock();
                 }
                 
-                // Remove from LRU tracking
+                // Remove from all structures
                 self.lru_list.removeNode(node);
                 _ = self.lru_map.remove(page_id);
-                
-                // Remove from page map (unlock LRU mutex temporarily)
-                self.lru_mutex.unlock();
                 _ = self.pages.remove(page_id);
                 
-                // Add to free list
-                self.free_pages_mutex.lock();
-                self.free_pages.append(page) catch {};
-                self.free_pages_mutex.unlock();
-                
+                // Free memory
                 self.allocator.destroy(node);
-                _ = self.evictions.fetchAdd(1, .monotonic);
+                self.allocator.destroy(page);
                 
-                std.debug.print("Evicted unpinned page {} (dirty: {})\n", .{ page_id, page.isDirtyAtomic() });
+                _ = self.evictions.fetchAdd(1, .monotonic);
                 return;
             }
             
-            current = node.prev;
+            victim_node = node.prev;
             attempts += 1;
         }
         
@@ -450,9 +368,24 @@ pub const BufferPool = struct {
         return DatabaseError.OutOfMemory;
     }
     
-    /// Write a dirty page back to file
-    fn writePageToFile(self: *Self, page: *Page) DatabaseError!void {
-        if (self.file == null) return; // No file to write to
+    /// Internal LRU addition - must be called with mutex held
+    fn addToLRUInternal(self: *Self, page_id: u32, page: *Page) DatabaseError!void {
+        const node = try self.allocator.create(LRUNode);
+        node.* = LRUNode{
+            .page_id = page_id,
+            .page_ptr = page,
+            .prev = null,
+            .next = null,
+            .access_count = 1,
+        };
+        
+        self.lru_list.addToFront(node);
+        try self.lru_map.put(page_id, node);
+    }
+    
+    /// Internal file write - must be called with mutex held
+    fn writePageToFileInternal(self: *Self, page: *Page) DatabaseError!void {
+        if (self.file == null) return;
         
         const file = self.file.?;
         const offset = page.page_id * PAGE_SIZE;
@@ -465,80 +398,35 @@ pub const BufferPool = struct {
             return DatabaseError.InternalError;
         };
         
-        // Mark page as clean after successful write
         page.clearDirty();
     }
     
-    /// Add page to LRU tracking
-    fn addToLRUTracking(self: *Self, page_id: u32, page: *Page) DatabaseError!void {
-        self.lru_mutex.lock();
-        defer self.lru_mutex.unlock();
-        
-        // Create new LRU node
-        const node = try self.allocator.create(LRUNode);
-        node.* = LRUNode{
-            .page_id = page_id,
-            .page_ptr = page,
-            .prev = null,
-            .next = null,
-            .last_access_time = @intCast(std.time.milliTimestamp()),
-            .access_count = 1,
-        };
-        
-        // Add to front of LRU list (most recently used)
-        self.lru_list.addToFront(node);
-        
-        // Add to hash map for quick lookup
-        try self.lru_map.put(page_id, node);
-    }
-    
-    /// Update LRU tracking when page is accessed
-    fn updateLRUAccess(self: *Self, page_id: u32, page: *Page) void {
-        _ = page; // unused in current implementation
-        
-        self.lru_mutex.lock();
-        defer self.lru_mutex.unlock();
-        
-        if (self.lru_map.get(page_id)) |node| {
-            // Update access time and count
-            node.last_access_time = @intCast(std.time.milliTimestamp());
-            node.access_count += 1;
-            
-            // Move to front of LRU list
-            self.lru_list.moveToFront(node);
-        }
-    }
-    
+    /// Internal file read - must be called with mutex held
     fn readPageFromFile(self: *Self, file: *std.fs.File, page_id: u32, page: *Page) !void {
         _ = self; // unused
         
-        // Calculate the offset for this page
         const offset = page_id * PAGE_SIZE;
         
-        // Get file size to check if page exists
         const file_size = file.getEndPos() catch {
-            // Can't get file size, assume file is invalid
             return error.FileNotOpen;
         };
         
-        // If the offset is beyond the file size, the page doesn't exist yet
         if (offset >= file_size) {
-            return error.IncompleteRead; // Caller will handle this as "new page"
+            return error.IncompleteRead;
         }
         
         file.seekTo(offset) catch {
-            // Seek failed, likely because file is closed
             return error.FileNotOpen;
         };
         
         const bytes_read = file.readAll(&page.data) catch {
-            // File read failed, likely because file is closed or page doesn't exist
             return error.FileNotOpen;
         };
         
         if (bytes_read != PAGE_SIZE) {
             return error.IncompleteRead;
         }
+        
         page.page_id = page_id;
         page.is_dirty = false;
         page.pin_count = 0;
@@ -559,13 +447,17 @@ pub const BufferPool = struct {
         const total_accesses = hits + misses;
         const hit_ratio = if (total_accesses > 0) @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(total_accesses)) else 0.0;
         
+        self.mutex.lock();
+        const pages_count = self.pages.count();
+        self.mutex.unlock();
+        
         return .{
             .cache_hits = hits,
             .cache_misses = misses,
             .evictions = self.evictions.load(.monotonic),
             .write_backs = self.write_backs.load(.monotonic),
             .hit_ratio = hit_ratio,
-            .pages_in_buffer = @as(u32, @intCast(self.pages.count())),
+            .pages_in_buffer = @as(u32, @intCast(pages_count)),
             .capacity = self.capacity,
         };
     }
@@ -573,6 +465,7 @@ pub const BufferPool = struct {
     /// Print buffer pool statistics
     pub fn printStatistics(self: *Self) void {
         const stats = self.getStatistics();
+        
         std.debug.print("\n=== Buffer Pool Statistics ===\n", .{});
         std.debug.print("Cache Hits: {}\n", .{stats.cache_hits});
         std.debug.print("Cache Misses: {}\n", .{stats.cache_misses});
@@ -583,3 +476,228 @@ pub const BufferPool = struct {
         std.debug.print("==============================\n\n", .{});
     }
 };
+
+// Comprehensive test suite
+test "LRUList basic operations" {
+    const allocator = std.testing.allocator;
+    var lru_list = LRUList.init(allocator);
+    defer lru_list.deinit();
+
+    // Test empty list
+    try std.testing.expect(lru_list.head == null);
+    try std.testing.expect(lru_list.tail == null);
+    try std.testing.expect(lru_list.count == 0);
+    try std.testing.expect(lru_list.getLRU() == null);
+
+    // Create test pages and nodes
+    var page1 = Page.init(1);
+    var page2 = Page.init(2);
+
+    const node1 = try allocator.create(LRUNode);
+    node1.* = LRUNode{
+        .page_id = 1,
+        .page_ptr = &page1,
+        .prev = null,
+        .next = null,
+        .access_count = 1,
+    };
+
+    const node2 = try allocator.create(LRUNode);
+    node2.* = LRUNode{
+        .page_id = 2,
+        .page_ptr = &page2,
+        .prev = null,
+        .next = null,
+        .access_count = 1,
+    };
+
+    // Test adding nodes
+    lru_list.addToFront(node1);
+    try std.testing.expect(lru_list.head == node1);
+    try std.testing.expect(lru_list.tail == node1);
+    try std.testing.expect(lru_list.count == 1);
+
+    lru_list.addToFront(node2);
+    try std.testing.expect(lru_list.head == node2);
+    try std.testing.expect(lru_list.tail == node1);
+    try std.testing.expect(lru_list.count == 2);
+
+    // Test moveToFront
+    lru_list.moveToFront(node1);
+    try std.testing.expect(lru_list.head == node1);
+    try std.testing.expect(lru_list.tail == node2);
+    try std.testing.expect(lru_list.getLRU() == node2);
+}
+
+test "BufferPool initialization and basic operations" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 3);
+    defer buffer_pool.deinit();
+
+    // Test initial state
+    const initial_stats = buffer_pool.getStatistics();
+    try std.testing.expect(initial_stats.cache_hits == 0);
+    try std.testing.expect(initial_stats.cache_misses == 0);
+    try std.testing.expect(initial_stats.pages_in_buffer == 0);
+    try std.testing.expect(initial_stats.capacity == 3);
+
+    // Test getting a page (cache miss)
+    const page1 = try buffer_pool.getPageShared(1);
+    try std.testing.expect(page1.page_id == 1);
+
+    var stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.cache_hits == 0);
+    try std.testing.expect(stats.cache_misses == 1);
+    try std.testing.expect(stats.pages_in_buffer == 1);
+
+    // Test getting same page again (cache hit)
+    const page1_again = try buffer_pool.getPageShared(1);
+    try std.testing.expect(page1_again == page1);
+
+    stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.cache_hits == 1);
+    try std.testing.expect(stats.cache_misses == 1);
+    try std.testing.expect(stats.hit_ratio == 0.5);
+
+    // Unpin pages
+    buffer_pool.unpinPageShared(1);
+    buffer_pool.unpinPageShared(1);
+}
+
+test "BufferPool exclusive access" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 3);
+    defer buffer_pool.deinit();
+
+    // Test exclusive access
+    const page1 = try buffer_pool.getPageExclusive(1);
+    try std.testing.expect(page1.page_id == 1);
+    
+    // Unpin the page first
+    buffer_pool.unpinPageExclusive(1, false);
+
+    // Test getting same page again (should be cache hit)
+    const page1_again = try buffer_pool.getPageExclusive(1);
+    try std.testing.expect(page1_again == page1);
+    
+    // Unpin the page again
+    buffer_pool.unpinPageExclusive(1, false);
+
+    const stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.cache_hits == 1);
+    try std.testing.expect(stats.cache_misses == 1);
+}
+
+test "BufferPool LRU eviction" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 2); // Small capacity
+    defer buffer_pool.deinit();
+
+    // Fill buffer to capacity
+    const page1 = try buffer_pool.getPageShared(1);
+    buffer_pool.unpinPageShared(1);
+
+    const page2 = try buffer_pool.getPageShared(2);
+    buffer_pool.unpinPageShared(2);
+
+    var stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.pages_in_buffer == 2);
+
+    // Access page 1 to make it more recently used
+    _ = try buffer_pool.getPageShared(1);
+    buffer_pool.unpinPageShared(1);
+
+    // Add third page - should evict page 2 (LRU)
+    _ = try buffer_pool.getPageShared(3);
+    buffer_pool.unpinPageShared(3);
+
+    stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.evictions >= 1);
+    try std.testing.expect(stats.pages_in_buffer == 2);
+
+    // Verify page 1 is still in buffer (cache hit)
+    const page1_again = try buffer_pool.getPageShared(1);
+    try std.testing.expect(page1_again == page1);
+    buffer_pool.unpinPageShared(1);
+
+    // Verify page 2 was evicted (cache miss)
+    const page2_again = try buffer_pool.getPageShared(2);
+    try std.testing.expect(page2_again != page2);
+    buffer_pool.unpinPageShared(2);
+}
+
+test "BufferPool page flushing" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 3);
+    defer buffer_pool.deinit();
+
+    // Create temporary file
+    const temp_file = std.fs.cwd().createFile("test_buffer.db", .{ .read = true }) catch |err| {
+        std.debug.print("Could not create test file: {}\n", .{err});
+        return;
+    };
+    defer {
+        temp_file.close();
+        std.fs.cwd().deleteFile("test_buffer.db") catch {};
+    }
+
+    buffer_pool.setFile(temp_file);
+
+    // Get page and mark as dirty
+    const page1 = try buffer_pool.getPageExclusive(1);
+    const test_data = "Hello, World!";
+    @memcpy(page1.data[0..test_data.len], test_data);
+    buffer_pool.unpinPageExclusive(1, true);
+
+    // Test flush
+    try buffer_pool.flushPage(1);
+    
+    var stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.write_backs == 1);
+
+    // Test flush all
+    const page2 = try buffer_pool.getPageExclusive(2);
+    @memcpy(page2.data[0..test_data.len], test_data);
+    buffer_pool.unpinPageExclusive(2, true);
+    
+    try buffer_pool.flushAll();
+    
+    stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.write_backs == 2);
+}
+
+test "BufferPool edge cases" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 1); // Capacity of 1
+    defer buffer_pool.deinit();
+
+    // Test unpinning non-existent pages
+    buffer_pool.unpinPageShared(999);
+    buffer_pool.unpinPageExclusive(999, false);
+
+    // Test flushing non-existent page
+    try buffer_pool.flushPage(999);
+
+    // Test legacy methods
+    const page1 = try buffer_pool.getPage(1);
+    try std.testing.expect(page1.page_id == 1);
+    try buffer_pool.unpinPage(1, false);
+}
+
+test "BufferPool concurrent access simulation" {
+    const allocator = std.testing.allocator;
+    var buffer_pool = BufferPool.init(allocator, 3);
+    defer buffer_pool.deinit();
+
+    // Get and immediately unpin multiple pages to simulate concurrent access
+    for (0..5) |i| {
+        const page = try buffer_pool.getPageShared(@as(u32, @intCast(i + 1)));
+        try std.testing.expect(page.page_id == @as(u32, @intCast(i + 1)));
+        buffer_pool.unpinPageShared(@as(u32, @intCast(i + 1)));
+    }
+    
+    const stats = buffer_pool.getStatistics();
+    try std.testing.expect(stats.cache_misses == 5);
+    try std.testing.expect(stats.evictions >= 2);
+    try std.testing.expect(stats.pages_in_buffer == 3);
+}
