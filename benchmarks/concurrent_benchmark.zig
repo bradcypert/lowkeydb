@@ -1,5 +1,6 @@
 const std = @import("std");
-const lowkeydb = @import("../src/root.zig");
+const lowkeydb = @import("src/root.zig");
+const logging = @import("src/logging.zig");
 
 const ConcurrentWorker = struct {
     thread_id: u32,
@@ -34,7 +35,7 @@ const ConcurrentWorker = struct {
     
     pub fn run(self: *ConcurrentWorker) void {
         const start_time = std.time.nanoTimestamp();
-        var prng = std.rand.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
         const random = prng.random();
         
         var operations: u32 = 0;
@@ -145,7 +146,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== LowkeyDB Concurrent Operations Benchmark ===\n\n");
+    // Initialize minimal logging for benchmarks
+    try logging.initGlobalLogger(allocator, logging.LogConfig{
+        .level = .warn, // Minimal logging for performance
+        .enable_colors = false,
+        .enable_timestamps = false,
+    });
+    defer logging.deinitGlobalLogger(allocator);
+
+    std.debug.print("=== LowkeyDB Concurrent Operations Benchmark ===\n\n", .{});
 
     // Different benchmark configurations to test various scenarios
     const configs = [_]BenchmarkConfig{
@@ -157,7 +166,7 @@ pub fn main() !void {
     };
 
     for (configs) |config| {
-        std.debug.print("🧪 Running benchmark: {s}\n", .{config.name});
+        std.debug.print("Running benchmark: {s}\n", .{config.name});
         std.debug.print("  Threads: {}, Ops/thread: {}, Read ratio: {d:.0}%\n", .{ config.num_threads, config.operations_per_thread, config.read_ratio * 100.0 });
 
         // Create fresh database for each benchmark
@@ -173,7 +182,7 @@ pub fn main() !void {
         defer db.close();
 
         // Pre-populate database with some data for read operations
-        std.debug.print("  Pre-populating database...\n");
+        std.debug.print("  Pre-populating database...\n", .{});
         for (0..5000) |i| {
             const key = try std.fmt.allocPrint(allocator, "concurrent_key_{}", .{i});
             defer allocator.free(key);
@@ -189,7 +198,7 @@ pub fn main() !void {
         defer db.stopAutoCheckpoint();
 
         // Create workers
-        var workers = try allocator.alloc(ConcurrentWorker, config.num_threads);
+        const workers = try allocator.alloc(ConcurrentWorker, config.num_threads);
         defer allocator.free(workers);
 
         for (workers, 0..) |*worker, i| {
@@ -197,11 +206,11 @@ pub fn main() !void {
         }
 
         // Create threads
-        var threads = try allocator.alloc(std.Thread, config.num_threads);
+        const threads = try allocator.alloc(std.Thread, config.num_threads);
         defer allocator.free(threads);
 
         // Start benchmark
-        std.debug.print("  Starting benchmark...\n");
+        std.debug.print("  Starting benchmark...\n", .{});
         const start_time = std.time.nanoTimestamp();
 
         for (threads, workers) |*thread, *worker| {
@@ -248,7 +257,7 @@ pub fn main() !void {
         const wal_stats = db.getCheckpointStats();
 
         // Print results
-        std.debug.print("  Results:\n");
+        std.debug.print("  Results:\n", .{});
         std.debug.print("    Total time: {d:.2} seconds\n", .{total_time_s});
         std.debug.print("    Total operations: {} ({} reads, {} writes, {} deletes)\n", .{ total_operations, total_reads, total_writes, total_deletes });
         std.debug.print("    Throughput: {d:.0} ops/sec\n", .{throughput});
@@ -257,7 +266,7 @@ pub fn main() !void {
         std.debug.print("    Failed operations: {}\n", .{total_failures});
         std.debug.print("    Thread time variance: {d:.2}ms\n", .{@as(f64, @floatFromInt(max_thread_time_ns - min_thread_time_ns)) / 1_000_000.0});
         
-        std.debug.print("  Database State:\n");
+        std.debug.print("  Database State:\n", .{});
         std.debug.print("    Final key count: {}\n", .{final_key_count});
         std.debug.print("    Buffer hit ratio: {d:.1}%\n", .{buffer_stats.hit_ratio});
         std.debug.print("    Cache hits: {}, misses: {}\n", .{ buffer_stats.cache_hits, buffer_stats.cache_misses });
@@ -268,22 +277,22 @@ pub fn main() !void {
 
         // Performance assessment
         if (throughput > 5000 and success_rate > 99.0 and buffer_stats.hit_ratio > 80.0) {
-            std.debug.print("    🎉 Performance: EXCELLENT\n");
+            std.debug.print("    Performance: EXCELLENT\n", .{});
         } else if (throughput > 2000 and success_rate > 95.0 and buffer_stats.hit_ratio > 60.0) {
-            std.debug.print("    ✅ Performance: GOOD\n");
+            std.debug.print("    Performance: GOOD\n", .{});
         } else if (throughput > 1000 and success_rate > 90.0) {
-            std.debug.print("    ⚠️  Performance: ACCEPTABLE\n");
+            std.debug.print("    Performance: ACCEPTABLE\n", .{});
         } else {
-            std.debug.print("    ❌ Performance: NEEDS IMPROVEMENT\n");
+            std.debug.print("    Performance: NEEDS IMPROVEMENT\n", .{});
         }
 
-        std.debug.print("\n");
+        std.debug.print("\n", .{});
     }
 
     // Summary benchmark - stress test with extreme concurrency
     {
-        std.debug.print("🚀 Final Stress Test: Extreme Concurrency\n");
-        std.debug.print("  32 threads × 500 ops each = 16,000 total operations\n");
+        std.debug.print("Final Stress Test: Extreme Concurrency\n", .{});
+        std.debug.print("  32 threads × 500 ops each = 16,000 total operations\n", .{});
 
         const stress_db_path = "stress_concurrent.db";
         std.fs.cwd().deleteFile(stress_db_path) catch {};
@@ -304,14 +313,14 @@ pub fn main() !void {
             .read_ratio = 0.6,
         };
 
-        var stress_workers = try allocator.alloc(ConcurrentWorker, stress_config.num_threads);
+        const stress_workers = try allocator.alloc(ConcurrentWorker, stress_config.num_threads);
         defer allocator.free(stress_workers);
 
         for (stress_workers, 0..) |*worker, i| {
             worker.* = ConcurrentWorker.init(@as(u32, @intCast(i)), &stress_db, allocator, stress_config.operations_per_thread, stress_config.read_ratio);
         }
 
-        var stress_threads = try allocator.alloc(std.Thread, stress_config.num_threads);
+        const stress_threads = try allocator.alloc(std.Thread, stress_config.num_threads);
         defer allocator.free(stress_threads);
 
         const stress_start_time = std.time.nanoTimestamp();
@@ -338,20 +347,20 @@ pub fn main() !void {
         const stress_throughput = @as(f64, @floatFromInt(stress_total_ops)) / stress_total_time_s;
         const stress_success_rate = @as(f64, @floatFromInt(stress_total_ops - stress_total_failures)) / @as(f64, @floatFromInt(stress_total_ops)) * 100.0;
 
-        std.debug.print("  Stress test results:\n");
+        std.debug.print("  Stress test results:\n", .{});
         std.debug.print("    Time: {d:.2} seconds\n", .{stress_total_time_s});
         std.debug.print("    Throughput: {d:.0} ops/sec\n", .{stress_throughput});
         std.debug.print("    Success rate: {d:.1}%\n", .{stress_success_rate});
         std.debug.print("    Total failures: {}\n", .{stress_total_failures});
 
         if (stress_success_rate > 95.0 and stress_throughput > 1000) {
-            std.debug.print("    🏆 STRESS TEST PASSED - Database handles extreme concurrency!\n");
+            std.debug.print("    STRESS TEST PASSED - Database handles extreme concurrency!\n", .{});
         } else {
-            std.debug.print("    ⚠️  STRESS TEST WARNING - Performance degraded under extreme load\n");
+            std.debug.print("    STRESS TEST WARNING - Performance degraded under extreme load\n", .{});
         }
     }
 
-    std.debug.print("\n=== CONCURRENT BENCHMARK COMPLETE ===\n");
-    std.debug.print("LowkeyDB concurrent performance has been thoroughly tested.\n");
-    std.debug.print("All benchmarks validate the database's thread-safety and performance characteristics.\n");
+    std.debug.print("\n=== CONCURRENT BENCHMARK COMPLETE ===\n", .{});
+    std.debug.print("LowkeyDB concurrent performance has been thoroughly tested.\n", .{});
+    std.debug.print("All benchmarks validate the database's thread-safety and performance characteristics.\n", .{});
 }

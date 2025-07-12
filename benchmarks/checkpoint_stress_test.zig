@@ -1,5 +1,6 @@
 const std = @import("std");
-const lowkeydb = @import("../src/root.zig");
+const lowkeydb = @import("src/root.zig");
+const logging = @import("src/logging.zig");
 
 const CheckpointStressWorker = struct {
     thread_id: u32,
@@ -30,7 +31,7 @@ const CheckpointStressWorker = struct {
         const start_time = std.time.milliTimestamp();
         const end_time = start_time + self.duration_seconds * 1000;
         
-        var prng = std.rand.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
         const random = prng.random();
         
         var operations: u32 = 0;
@@ -190,7 +191,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== LowkeyDB Checkpoint Stress Test ===\n\n");
+    // Initialize minimal logging for benchmarks
+    try logging.initGlobalLogger(allocator, logging.LogConfig{
+        .level = .warn, // Minimal logging for performance
+        .enable_colors = false,
+        .enable_timestamps = false,
+    });
+    defer logging.deinitGlobalLogger(allocator);
+
+    std.debug.print("=== LowkeyDB Checkpoint Stress Test ===\n\n", .{});
 
     // Test configuration
     const num_threads = 6;
@@ -300,7 +309,7 @@ pub fn main() !void {
         const final_buffer_stats = db.getBufferPoolStats();
 
         // Print results
-        std.debug.print("  Results:\n");
+        std.debug.print("  Results:\n", .{});
         std.debug.print("    Duration: {d:.1} seconds\n", .{actual_duration_s});
         std.debug.print("    Total operations: {}\n", .{total_operations});
         std.debug.print("    Data processed: {d:.2} MB\n", .{@as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0)});
@@ -315,15 +324,15 @@ pub fn main() !void {
         std.debug.print("    Errors encountered: {}\n", .{total_errors});
         
         if (total_errors == 0) {
-            std.debug.print("    ✅ Test PASSED - No errors detected\n");
+            std.debug.print("    Test PASSED - No errors detected\n", .{});
         } else {
-            std.debug.print("    ❌ Test had {} errors\n", .{total_errors});
+            std.debug.print("    Test had {} errors\n", .{total_errors});
         }
         
-        std.debug.print("\n");
+        std.debug.print("\n", .{});
     }
 
-    std.debug.print("=== CHECKPOINT STRESS TEST COMPLETE ===\n");
-    std.debug.print("Checkpoint thread performed reliably under heavy concurrent load.\n");
-    std.debug.print("WAL management and data integrity maintained throughout all tests.\n");
+    std.debug.print("=== CHECKPOINT STRESS TEST COMPLETE ===\n", .{});
+    std.debug.print("Checkpoint thread performed reliably under heavy concurrent load.\n", .{});
+    std.debug.print("WAL management and data integrity maintained throughout all tests.\n", .{});
 }

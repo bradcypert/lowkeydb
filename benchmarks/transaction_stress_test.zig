@@ -1,5 +1,6 @@
 const std = @import("std");
-const lowkeydb = @import("../src/root.zig");
+const lowkeydb = @import("src/root.zig");
+const logging = @import("src/logging.zig");
 
 const TransactionWorker = struct {
     thread_id: u32,
@@ -32,7 +33,7 @@ const TransactionWorker = struct {
     
     pub fn run(self: *TransactionWorker) void {
         const start_time = std.time.nanoTimestamp();
-        var prng = std.rand.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.milliTimestamp())) + self.thread_id);
         const random = prng.random();
         
         var operations_completed: u32 = 0;
@@ -85,40 +86,40 @@ const TransactionWorker = struct {
                         };
                     },
                     1 => { // GET
-                        const value = self.db.getTransaction(tx_id, key, self.allocator) catch |err| {
+                        if (self.db.getTransaction(tx_id, key, self.allocator)) |value| {
+                            if (value) |v| {
+                                self.allocator.free(v);
+                            }
+                        } else |err| {
                             if (err == lowkeydb.DatabaseError.TransactionConflict) {
                                 conflicts += 1;
                                 transaction_success = false;
                                 break;
                             } else if (err == lowkeydb.DatabaseError.KeyNotFound) {
                                 // Key not found is not an error in this test
-                                null;
                             } else {
                                 std.debug.print("Thread {}: GET failed: {}\n", .{ self.thread_id, err });
                                 transaction_success = false;
                                 break;
                             }
-                        };
-                        
-                        if (value) |v| {
-                            self.allocator.free(v);
                         }
                     },
                     2 => { // DELETE
-                        _ = self.db.deleteTransaction(tx_id, key) catch |err| {
+                        if (self.db.deleteTransaction(tx_id, key)) |_| {
+                            // Delete succeeded
+                        } else |err| {
                             if (err == lowkeydb.DatabaseError.TransactionConflict) {
                                 conflicts += 1;
                                 transaction_success = false;
                                 break;
                             } else if (err == lowkeydb.DatabaseError.KeyNotFound) {
                                 // Key not found is not an error in this test
-                                false;
                             } else {
                                 std.debug.print("Thread {}: DELETE failed: {}\n", .{ self.thread_id, err });
                                 transaction_success = false;
                                 break;
                             }
-                        };
+                        }
                     },
                     else => unreachable,
                 }
@@ -173,7 +174,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("=== LowkeyDB Transaction Stress Test ===\n\n");
+    // Initialize minimal logging for benchmarks
+    try logging.initGlobalLogger(allocator, logging.LogConfig{
+        .level = .warn, // Minimal logging for performance
+        .enable_colors = false,
+        .enable_timestamps = false,
+    });
+    defer logging.deinitGlobalLogger(allocator);
+
+    std.debug.print("=== LowkeyDB Transaction Stress Test ===\n\n", .{});
 
     // Test configuration
     const num_threads = 8;
@@ -204,12 +213,12 @@ pub fn main() !void {
         defer db.close();
 
         // Start auto-checkpointing with aggressive settings for stress testing
-        try db.configureCheckpointing(1000, 1, 5); // 1 second interval, 1MB max WAL
+        db.configureCheckpointing(1000, 1, 5); // 1 second interval, 1MB max WAL
         try db.startAutoCheckpoint();
         defer db.stopAutoCheckpoint();
 
         // Create workers
-        var workers = try allocator.alloc(TransactionWorker, num_threads);
+        const workers = try allocator.alloc(TransactionWorker, num_threads);
         defer allocator.free(workers);
 
         for (workers, 0..) |*worker, i| {
@@ -217,7 +226,7 @@ pub fn main() !void {
         }
 
         // Start threads
-        var threads = try allocator.alloc(std.Thread, num_threads);
+        const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
 
         const start_time = std.time.nanoTimestamp();
@@ -272,10 +281,10 @@ pub fn main() !void {
         std.debug.print("  WAL size: {} bytes\n", .{wal_stats.wal_size});
         std.debug.print("  Checkpoints performed: {}\n", .{wal_stats.checkpoints_performed});
 
-        std.debug.print("\n");
+        std.debug.print("\n", .{});
     }
 
-    std.debug.print("=== STRESS TEST COMPLETE ===\n");
-    std.debug.print("All isolation levels tested successfully.\n");
-    std.debug.print("Database maintained consistency under heavy concurrent load.\n");
+    std.debug.print("=== STRESS TEST COMPLETE ===\n", .{});
+    std.debug.print("All isolation levels tested successfully.\n", .{});
+    std.debug.print("Database maintained consistency under heavy concurrent load.\n", .{});
 }
