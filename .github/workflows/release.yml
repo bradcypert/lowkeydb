@@ -1,0 +1,283 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  ZIG_VERSION: 0.14.0
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate changelog
+      run: |
+        echo "# LowkeyDB Release ${{ steps.get_version.outputs.version }}" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "## What's New" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        
+        # Get commits since last tag
+        if git describe --tags --abbrev=0 HEAD~1 >/dev/null 2>&1; then
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1)
+          echo "### Changes since $LAST_TAG:" >> CHANGELOG.md
+          git log --pretty=format:"- %s (%h)" $LAST_TAG..HEAD >> CHANGELOG.md
+        else
+          echo "### Initial Release" >> CHANGELOG.md
+          echo "This is the first release of LowkeyDB!" >> CHANGELOG.md
+        fi
+        
+        echo "" >> CHANGELOG.md
+        echo "## Features" >> CHANGELOG.md
+        echo "- ✅ ACID transactions with multiple isolation levels" >> CHANGELOG.md
+        echo "- ✅ Thread-safe concurrent operations" >> CHANGELOG.md
+        echo "- ✅ High performance (25,000+ write ops/sec)" >> CHANGELOG.md
+        echo "- ✅ Crash recovery with WAL" >> CHANGELOG.md
+        echo "- ✅ Multiple language bindings (Zig, C, Flutter/Dart)" >> CHANGELOG.md
+        echo "- ✅ Comprehensive test suite and benchmarks" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "## Installation" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "Download the appropriate binary for your platform from the release assets below." >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "### Language Bindings" >> CHANGELOG.md
+        echo "- **Zig**: Use as a package or include source directly" >> CHANGELOG.md
+        echo "- **C/C++**: Link with the provided static library" >> CHANGELOG.md
+        echo "- **Flutter/Dart**: Use the FFI wrapper with platform libraries" >> CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        echo "See the [integration guides](https://github.com/bradcypert/lowkeydb/tree/main/docs) for detailed setup instructions." >> CHANGELOG.md
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: LowkeyDB ${{ steps.get_version.outputs.version }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: ${{ contains(steps.get_version.outputs.version, 'beta') || contains(steps.get_version.outputs.version, 'alpha') || contains(steps.get_version.outputs.version, 'rc') }}
+
+  build-artifacts:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-linux
+            archive: tar.gz
+          - name: Linux ARM64
+            os: ubuntu-latest
+            target: aarch64-linux
+            archive: tar.gz
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-windows
+            archive: zip
+          - name: macOS x86_64
+            os: macos-latest
+            target: x86_64-macos
+            archive: tar.gz
+          - name: macOS ARM64
+            os: macos-latest
+            target: aarch64-macos
+            archive: tar.gz
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Build executable
+      run: |
+        zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+    - name: Build C API library
+      run: |
+        zig build-lib src/c_api.zig -lc --name lowkeydb -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+    - name: Prepare release package
+      shell: bash
+      run: |
+        mkdir -p release-package
+        
+        # Copy executables
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cp zig-out/bin/lowkeydb.exe release-package/ 2>/dev/null || echo "No Windows executable found"
+          cp lowkeydb.lib release-package/ 2>/dev/null || echo "No Windows library found"
+          cp lowkeydb.dll release-package/ 2>/dev/null || echo "No Windows DLL found"
+        else
+          cp zig-out/bin/lowkeydb release-package/ 2>/dev/null || echo "No executable found"
+          cp liblowkeydb.* release-package/ 2>/dev/null || echo "No library found"
+        fi
+        
+        # Copy static library
+        cp zig-out/lib/liblowkeydb.a release-package/ 2>/dev/null || echo "No static library found"
+        
+        # Copy headers and documentation
+        cp include/lowkeydb.h release-package/ 2>/dev/null || echo "No header file found"
+        cp README.md release-package/
+        cp -r docs release-package/ 2>/dev/null || echo "No docs directory found"
+        
+        # Create platform-specific README
+        cat > release-package/README-PLATFORM.md << EOF
+        # LowkeyDB for ${{ matrix.name }}
+        
+        This package contains LowkeyDB compiled for ${{ matrix.target }}.
+        
+        ## Contents
+        - \`lowkeydb\` or \`lowkeydb.exe\` - Command-line interface
+        - \`liblowkeydb.a\` - Static library for linking
+        - \`lowkeydb.h\` - C header file
+        - \`docs/\` - Integration guides and documentation
+        
+        ## Quick Start
+        
+        ### Using the CLI
+        \`\`\`bash
+        ./lowkeydb my_database.db
+        \`\`\`
+        
+        ### Using the C API
+        \`\`\`bash
+        gcc -I. -L. -o my_app my_app.c -llowkeydb
+        \`\`\`
+        
+        ## Documentation
+        
+        See the \`docs/\` directory for complete integration guides:
+        - \`INTEGRATION_ZIG.md\` - Native Zig integration
+        - \`INTEGRATION_C.md\` - C/C++ integration
+        - \`INTEGRATION_FLUTTER.md\` - Flutter/Dart integration
+        
+        ## Performance
+        
+        LowkeyDB delivers:
+        - 25,000+ write operations per second
+        - 50,000+ read operations per second
+        - ACID transaction compliance
+        - Thread-safe concurrent operations
+        
+        Visit https://github.com/bradcypert/lowkeydb for more information.
+        EOF
+
+    - name: Create archive
+      shell: bash
+      run: |
+        cd release-package
+        
+        if [[ "${{ matrix.archive }}" == "zip" ]]; then
+          # Windows zip
+          powershell -Command "Compress-Archive -Path * -DestinationPath ../lowkeydb-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip"
+        else
+          # Unix tar.gz
+          tar -czf ../lowkeydb-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz *
+        fi
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./lowkeydb-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+        asset_name: lowkeydb-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+        asset_content_type: application/octet-stream
+
+  build-source:
+    name: Build Source Archive
+    runs-on: ubuntu-latest
+    needs: create-release
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create source archive
+      run: |
+        # Create clean source archive
+        git archive --format=tar.gz --prefix=lowkeydb-${{ needs.create-release.outputs.version }}/ HEAD > lowkeydb-${{ needs.create-release.outputs.version }}-source.tar.gz
+
+    - name: Upload Source Archive
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./lowkeydb-${{ needs.create-release.outputs.version }}-source.tar.gz
+        asset_name: lowkeydb-${{ needs.create-release.outputs.version }}-source.tar.gz
+        asset_content_type: application/gzip
+
+  post-release:
+    name: Post-Release Tasks
+    runs-on: ubuntu-latest
+    needs: [create-release, build-artifacts, build-source]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Update version in build.zig.zon
+      run: |
+        # Update version in build.zig.zon if needed
+        VERSION="${{ needs.create-release.outputs.version }}"
+        VERSION_NUMBER="${VERSION#v}"  # Remove 'v' prefix
+        
+        if [ -f build.zig.zon ]; then
+          sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION_NUMBER\"/" build.zig.zon
+          
+          if ! diff -q build.zig.zon build.zig.zon.bak >/dev/null; then
+            echo "Updated version in build.zig.zon to $VERSION_NUMBER"
+          fi
+          
+          rm -f build.zig.zon.bak
+        fi
+
+    - name: Notify success
+      run: |
+        echo "🎉 Release ${{ needs.create-release.outputs.version }} has been successfully published!"
+        echo ""
+        echo "📦 Available downloads:"
+        echo "- Linux x86_64 and ARM64"
+        echo "- Windows x86_64"
+        echo "- macOS x86_64 and ARM64"
+        echo "- Source code archive"
+        echo ""
+        echo "🔗 Release URL: https://github.com/bradcypert/lowkeydb/releases/tag/${{ needs.create-release.outputs.version }}"
+        echo ""
+        echo "📚 Documentation: https://github.com/bradcypert/lowkeydb/tree/main/docs"

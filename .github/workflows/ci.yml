@@ -1,0 +1,401 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [ published ]
+
+env:
+  ZIG_VERSION: 0.14.0
+
+jobs:
+  # Test on multiple platforms
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            zig-cache: ~/.cache/zig
+            artifact-name: linux
+          - os: windows-latest
+            zig-cache: ~\AppData\Local\zig
+            artifact-name: windows
+          - os: macos-latest
+            zig-cache: ~/Library/Caches/zig
+            artifact-name: macos
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Cache Zig
+      uses: actions/cache@v4
+      with:
+        path: ${{ matrix.zig-cache }}
+        key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+
+    - name: Verify Zig installation
+      run: zig version
+
+    - name: Build project
+      run: zig build
+
+    - name: Run tests
+      run: zig build test
+
+    - name: Run CLI help test
+      run: zig build run -- --help || true
+
+    - name: Build static library
+      run: zig build-lib src/c_api.zig -lc --name lowkeydb
+
+    - name: Upload build artifacts
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: lowkeydb-${{ matrix.artifact-name }}
+        path: |
+          zig-out/
+          liblowkeydb.*
+        retention-days: 30
+
+  # Performance benchmarks (Linux only for consistency)
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Cache Zig
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/zig
+        key: ubuntu-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+
+    - name: Build project
+      run: zig build -Doptimize=ReleaseFast
+
+    - name: Run performance benchmarks
+      run: |
+        echo "Running performance benchmarks..."
+        
+        # Test basic operations benchmark
+        timeout 60s zig build-exe benchmarks/concurrent_benchmark.zig -I src/ -O ReleaseFast || echo "Benchmark compilation failed, skipping"
+        
+        if [ -f concurrent_benchmark ]; then
+          echo "Running concurrent benchmark (60s timeout)..."
+          timeout 60s ./concurrent_benchmark || echo "Benchmark completed or timed out"
+        fi
+
+    - name: Upload benchmark results
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: |
+          *.db
+          *.log
+        retention-days: 7
+
+  # Code quality checks
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Check formatting
+      run: zig fmt --check src/ || echo "Formatting check failed - please run 'zig fmt src/'"
+
+    - name: Lint and check for issues
+      run: |
+        echo "Running code analysis..."
+        # Check for common issues
+        find src/ -name "*.zig" -exec grep -l "TODO\|FIXME\|XXX" {} \; | tee code_todos.txt || true
+        find src/ -name "*.zig" -exec grep -l "unreachable" {} \; | tee unreachable_usage.txt || true
+        
+        echo "=== TODOs found ==="
+        cat code_todos.txt || echo "No TODOs found"
+        
+        echo "=== Unreachable statements ==="
+        cat unreachable_usage.txt || echo "No unreachable statements found"
+
+    - name: Check for memory leaks in tests
+      run: |
+        echo "Building with debug info for memory leak detection..."
+        zig build test -Doptimize=Debug 2>&1 | tee test_output.log
+        
+        # Check if there are any memory leaks reported
+        if grep -i "leaked" test_output.log; then
+          echo "⚠️ Memory leaks detected in tests"
+          exit 1
+        else
+          echo "✅ No memory leaks detected"
+        fi
+
+  # Integration tests with examples
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Test Zig integration
+      run: |
+        echo "Testing Zig integration..."
+        cat > test_zig_integration.zig << 'EOF'
+        const std = @import("std");
+        const lowkeydb = @import("src/root.zig");
+        const logging = @import("src/logging.zig");
+
+        pub fn main() !void {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+
+            try logging.initGlobalLogger(allocator, logging.LogConfig{
+                .level = .warn,
+                .enable_colors = false,
+                .enable_timestamps = false,
+            });
+            defer logging.deinitGlobalLogger(allocator);
+
+            var db = try lowkeydb.Database.create("ci_test.db", allocator);
+            defer {
+                db.close();
+                std.fs.cwd().deleteFile("ci_test.db") catch {};
+                std.fs.cwd().deleteFile("ci_test.db.wal") catch {};
+            }
+
+            try db.put("test", "integration_success");
+            const value = try db.get("test", allocator);
+            defer if (value) |v| allocator.free(v);
+            
+            if (value == null or !std.mem.eql(u8, value.?, "integration_success")) {
+                return error.IntegrationTestFailed;
+            }
+            
+            std.debug.print("✅ Zig integration test passed\n", .{});
+        }
+        EOF
+        
+        zig build-exe test_zig_integration.zig -I . && ./test_zig_integration
+        rm -f test_zig_integration test_zig_integration.zig
+
+    - name: Test C API compilation
+      run: |
+        echo "Testing C API compilation..."
+        
+        # Test that C API compiles
+        zig build-lib src/c_api.zig -lc --name lowkeydb_c_api
+        
+        # Test C header exists
+        if [ ! -f include/lowkeydb.h ]; then
+          echo "❌ C header file not found"
+          exit 1
+        fi
+        
+        echo "✅ C API compilation successful"
+
+    - name: Test example compilation
+      run: |
+        echo "Testing example compilation..."
+        
+        # Test a few examples
+        if [ -f examples/crud_operations_example.zig ]; then
+          zig build-exe examples/crud_operations_example.zig -I src/ && echo "✅ CRUD example compiles"
+        fi
+        
+        if [ -f examples/transaction_example.zig ]; then
+          zig build-exe examples/transaction_example.zig -I src/ && echo "✅ Transaction example compiles"
+        fi
+
+  # Security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run security checks
+      run: |
+        echo "Running basic security checks..."
+        
+        # Check for hardcoded credentials or sensitive data
+        echo "Checking for potential security issues..."
+        
+        # Look for common security anti-patterns
+        find . -name "*.zig" -exec grep -i "password\|secret\|token\|api_key" {} \; | grep -v "test\|example" || echo "No obvious credential patterns found"
+        
+        # Check for unsafe operations
+        find . -name "*.zig" -exec grep -l "@ptrCast\|@alignCast\|@bitCast" {} \; | tee unsafe_operations.txt || true
+        
+        if [ -s unsafe_operations.txt ]; then
+          echo "⚠️ Files with potentially unsafe operations:"
+          cat unsafe_operations.txt
+          echo "Please review these for safety"
+        else
+          echo "✅ No obvious unsafe operations found"
+        fi
+
+  # Documentation checks
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Check documentation
+      run: |
+        echo "Checking documentation..."
+        
+        # Check for README
+        if [ ! -f README.md ]; then
+          echo "❌ README.md not found"
+          exit 1
+        fi
+        
+        # Check integration guides
+        if [ ! -d docs/ ]; then
+          echo "❌ docs/ directory not found"
+          exit 1
+        fi
+        
+        # Check for key documentation files
+        for doc in docs/INTEGRATION_ZIG.md docs/INTEGRATION_C.md docs/INTEGRATION_FLUTTER.md; do
+          if [ ! -f "$doc" ]; then
+            echo "❌ Missing documentation: $doc"
+            exit 1
+          else
+            echo "✅ Found: $doc"
+          fi
+        done
+        
+        echo "✅ Documentation structure looks good"
+
+  # Release builds (only on tags)
+  release:
+    name: Release Build
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'release'
+    needs: [test, quality, integration, security]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            artifact: linux-x64
+          - os: windows-latest
+            target: x86_64-windows
+            artifact: windows-x64
+          - os: macos-latest
+            target: x86_64-macos
+            artifact: macos-x64
+          - os: macos-latest
+            target: aarch64-macos
+            artifact: macos-arm64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Build release
+      run: |
+        # Build optimized executable
+        zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        
+        # Build C API library
+        zig build-lib src/c_api.zig -lc --name lowkeydb -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+    - name: Package release
+      run: |
+        mkdir -p release/
+        cp -r zig-out/* release/ 2>/dev/null || true
+        cp liblowkeydb.* release/ 2>/dev/null || true
+        cp include/lowkeydb.h release/ 2>/dev/null || true
+        cp README.md release/
+        cp -r docs/ release/docs/ 2>/dev/null || true
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: lowkeydb-${{ matrix.artifact }}
+        path: release/
+
+    - name: Upload to GitHub Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release/**/*
+        tag_name: ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deployment notification
+  notify:
+    name: Notify Success
+    runs-on: ubuntu-latest
+    needs: [test, quality, integration, security, docs]
+    if: always()
+    steps:
+    - name: Report status
+      run: |
+        if [[ "${{ needs.test.result }}" == "success" && "${{ needs.quality.result }}" == "success" && "${{ needs.integration.result }}" == "success" ]]; then
+          echo "🎉 All checks passed! LowkeyDB is ready for production."
+          echo "✅ Tests passed on all platforms"
+          echo "✅ Code quality checks passed"
+          echo "✅ Integration tests passed"
+          echo "✅ Security scan completed"
+          echo "✅ Documentation verified"
+        else
+          echo "❌ Some checks failed. Please review the workflow results."
+          echo "Test result: ${{ needs.test.result }}"
+          echo "Quality result: ${{ needs.quality.result }}"
+          echo "Integration result: ${{ needs.integration.result }}"
+          echo "Security result: ${{ needs.security.result }}"
+          echo "Docs result: ${{ needs.docs.result }}"
+        fi

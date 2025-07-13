@@ -1,0 +1,178 @@
+name: Performance Benchmarks
+
+# Performance benchmark runs on demand and code changes
+on:
+  workflow_dispatch:
+    # Allow manual triggering
+  push:
+    branches: [ main ]
+    paths: 
+      - 'src/**'
+      - 'benchmarks/**'
+      - 'build.zig'
+
+env:
+  ZIG_VERSION: 0.14.0
+
+jobs:
+  performance-benchmarks:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Build optimized version
+      run: zig build -Doptimize=ReleaseFast
+
+    - name: Prepare benchmark environment
+      run: |
+        # Ensure clean state
+        rm -f *.db *.wal
+        
+        # Create results directory
+        mkdir -p benchmark-results
+        
+        # System info for context
+        echo "=== System Information ===" > benchmark-results/system-info.txt
+        uname -a >> benchmark-results/system-info.txt
+        cat /proc/cpuinfo | grep "model name" | head -1 >> benchmark-results/system-info.txt
+        cat /proc/meminfo | grep "MemTotal" >> benchmark-results/system-info.txt
+        echo "Date: $(date)" >> benchmark-results/system-info.txt
+
+    - name: Run concurrent benchmark
+      run: |
+        echo "Running concurrent benchmark..."
+        timeout 300s zig build-exe benchmarks/concurrent_benchmark.zig -I src/ -O ReleaseFast
+        
+        if [ -f concurrent_benchmark ]; then
+          echo "=== Concurrent Benchmark Results ===" | tee benchmark-results/concurrent.log
+          timeout 300s ./concurrent_benchmark 2>&1 | tee -a benchmark-results/concurrent.log || echo "Benchmark completed or timed out"
+        fi
+
+    - name: Run transaction stress test
+      run: |
+        echo "Running transaction stress test..."
+        timeout 300s zig build-exe benchmarks/transaction_stress_test.zig -I src/ -O ReleaseFast
+        
+        if [ -f transaction_stress_test ]; then
+          echo "=== Transaction Stress Test Results ===" | tee benchmark-results/transactions.log
+          timeout 300s ./transaction_stress_test 2>&1 | tee -a benchmark-results/transactions.log || echo "Test completed or timed out"
+        fi
+
+    - name: Run checkpoint stress test  
+      run: |
+        echo "Running checkpoint stress test..."
+        timeout 300s zig build-exe benchmarks/checkpoint_stress_test.zig -I src/ -O ReleaseFast
+        
+        if [ -f checkpoint_stress_test ]; then
+          echo "=== Checkpoint Stress Test Results ===" | tee benchmark-results/checkpoint.log
+          timeout 300s ./checkpoint_stress_test 2>&1 | tee -a benchmark-results/checkpoint.log || echo "Test completed or timed out"
+        fi
+
+    - name: Run statistics validation
+      run: |
+        echo "Running statistics validation..."
+        timeout 300s zig build-exe benchmarks/statistics_validation.zig -I src/ -O ReleaseFast
+        
+        if [ -f statistics_validation ]; then
+          echo "=== Statistics Validation Results ===" | tee benchmark-results/statistics.log
+          timeout 300s ./statistics_validation 2>&1 | tee -a benchmark-results/statistics.log || echo "Validation completed or timed out"
+        fi
+
+    - name: Extract performance metrics
+      run: |
+        echo "Extracting key performance metrics..."
+        
+        # Create summary report
+        cat > benchmark-results/summary.md << 'EOF'
+        # LowkeyDB Performance Report
+        
+        **Date:** $(date)
+        **Commit:** ${{ github.sha }}
+        **Branch:** ${{ github.ref_name }}
+        
+        ## System Information
+        ```
+        EOF
+        
+        cat benchmark-results/system-info.txt >> benchmark-results/summary.md
+        
+        cat >> benchmark-results/summary.md << 'EOF'
+        ```
+        
+        ## Performance Highlights
+        
+        EOF
+        
+        # Extract throughput numbers from logs
+        if [ -f benchmark-results/concurrent.log ]; then
+          echo "### Concurrent Operations" >> benchmark-results/summary.md
+          grep -i "throughput\|ops/sec\|performance" benchmark-results/concurrent.log | head -5 >> benchmark-results/summary.md || echo "No throughput data found"
+          echo "" >> benchmark-results/summary.md
+        fi
+        
+        if [ -f benchmark-results/transactions.log ]; then
+          echo "### Transaction Performance" >> benchmark-results/summary.md
+          grep -i "throughput\|tx/sec\|commit rate" benchmark-results/transactions.log | head -5 >> benchmark-results/summary.md || echo "No transaction data found"
+          echo "" >> benchmark-results/summary.md
+        fi
+        
+        # Add file sizes for context
+        echo "### Database Files Created" >> benchmark-results/summary.md
+        ls -lah *.db *.wal 2>/dev/null | head -10 >> benchmark-results/summary.md || echo "No database files found"
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-${{ github.run_number }}
+        path: benchmark-results/
+        retention-days: 90
+
+    - name: Performance regression check
+      run: |
+        echo "Checking for performance regressions..."
+        
+        # Simple regression detection (in a real setup, you'd compare with historical data)
+        if grep -qi "performance.*needs improvement\|error\|failed" benchmark-results/*.log; then
+          echo "⚠️ Potential performance issues detected"
+          echo "Please review the benchmark results"
+          # Don't fail the job, just warn
+        else
+          echo "✅ Performance benchmarks completed successfully"
+        fi
+
+    - name: Comment PR with results (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          try {
+            const summary = fs.readFileSync('benchmark-results/summary.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📊 Performance Benchmark Results\n\n${summary}\n\n*Benchmarks ran on commit ${{ github.sha }}*`
+            });
+          } catch (error) {
+            console.log('Could not post benchmark results:', error);
+          }
+
+    - name: Cleanup
+      if: always()
+      run: |
+        # Clean up large benchmark files
+        rm -f *.db *.wal
+        rm -f concurrent_benchmark transaction_stress_test checkpoint_stress_test statistics_validation
+        
+        echo "Benchmark run completed at $(date)"

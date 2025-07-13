@@ -1,0 +1,67 @@
+name: Quick Check
+
+# Fast feedback workflow for development
+on:
+  push:
+    branches-ignore: [ main ]
+  pull_request:
+    types: [ opened, synchronize ]
+
+env:
+  ZIG_VERSION: 0.14.0
+
+jobs:
+  quick-test:
+    name: Quick Test (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Cache Zig
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/zig
+        key: quick-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+
+    - name: Quick build check
+      run: zig build
+
+    - name: Quick test run
+      run: zig build test
+
+    - name: Format check
+      run: zig fmt --check src/ || echo "⚠️ Code formatting issues found"
+
+    - name: Basic integration test
+      run: |
+        echo "quit" | timeout 10s zig build run -- test_quick.db || echo "CLI test completed"
+        rm -f test_quick.db test_quick.db.wal
+
+  build-check:
+    name: Build Check (All Platforms)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+
+    - name: Build only
+      run: zig build
+
+    - name: Test compilation of C API
+      run: zig build-lib src/c_api.zig -lc --name lowkeydb
