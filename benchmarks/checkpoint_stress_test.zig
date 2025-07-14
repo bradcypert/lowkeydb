@@ -101,19 +101,23 @@ const CheckpointStressWorker = struct {
                         tx_bytes += key.len + value.len;
                     },
                     1 => { // GET
-                        const value = self.db.getTransaction(tx_id, key, self.allocator) catch |err| {
-                            if (err != lowkeydb.DatabaseError.TransactionConflict and err != lowkeydb.DatabaseError.KeyNotFound) {
+                        if (self.db.getTransaction(tx_id, key, self.allocator)) |value| {
+                            if (value) |v| {
+                                tx_bytes += v.len;
+                                self.allocator.free(v);
+                            }
+                        } else |err| {
+                            if (err == lowkeydb.DatabaseError.TransactionConflict) {
+                                tx_success = false;
+                                break;
+                            } else if (err == lowkeydb.DatabaseError.KeyNotFound) {
+                                // Key not found is not an error in this test
+                            } else {
                                 std.debug.print("Thread {}: GET failed: {}\n", .{ self.thread_id, err });
                                 errors += 1;
                                 tx_success = false;
                                 break;
                             }
-                            null;
-                        };
-                        
-                        if (value) |v| {
-                            tx_bytes += v.len;
-                            self.allocator.free(v);
                         }
                     },
                     2 => { // DELETE
@@ -239,7 +243,7 @@ pub fn main() !void {
         defer db.stopAutoCheckpoint();
 
         // Create workers
-        var workers = try allocator.alloc(CheckpointStressWorker, num_threads);
+        const workers = try allocator.alloc(CheckpointStressWorker, num_threads);
         defer allocator.free(workers);
 
         for (workers, 0..) |*worker, i| {
@@ -247,7 +251,7 @@ pub fn main() !void {
         }
 
         // Start threads
-        var threads = try allocator.alloc(std.Thread, num_threads);
+        const threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
 
         const start_time = std.time.milliTimestamp();
