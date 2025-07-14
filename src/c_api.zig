@@ -59,7 +59,7 @@ fn zigErrorToC(err: anyerror) c_int {
     return switch (err) {
         DatabaseError.KeyNotFound => LOWKEY_ERROR_KEY_NOT_FOUND,
         DatabaseError.TransactionConflict => LOWKEY_ERROR_TRANSACTION_CONFLICT,
-        DatabaseError.InvalidTransaction => LOWKEY_ERROR_INVALID_TRANSACTION,
+        DatabaseError.TransactionNotActive => LOWKEY_ERROR_INVALID_TRANSACTION,
         error.OutOfMemory => LOWKEY_ERROR_MEMORY,
         else => LOWKEY_ERROR_GENERIC,
     };
@@ -327,7 +327,7 @@ export fn lowkeydb_get_buffer_stats(db_handle: ?*LowkeyDB, stats: *LowkeyDBBuffe
     const buffer_stats = wrapper.db.getBufferPoolStats();
     
     stats.* = LowkeyDBBufferStats{
-        .capacity = buffer_stats.capacity,
+        .capacity = @as(u32, @intCast(buffer_stats.capacity)),
         .pages_in_buffer = buffer_stats.pages_in_buffer,
         .cache_hits = buffer_stats.cache_hits,
         .cache_misses = buffer_stats.cache_misses,
