@@ -49,7 +49,8 @@ jobs:
     - name: Run concurrent benchmark
       run: |
         echo "Running concurrent benchmark..."
-        timeout 300s zig build-exe benchmarks/concurrent_benchmark.zig -I src/ -O ReleaseFast
+        cp benchmarks/concurrent_benchmark.zig .
+        timeout 300s zig build-exe concurrent_benchmark.zig -I src/ -O ReleaseFast
         
         if [ -f concurrent_benchmark ]; then
           echo "=== Concurrent Benchmark Results ===" | tee benchmark-results/concurrent.log
@@ -59,7 +60,8 @@ jobs:
     - name: Run transaction stress test
       run: |
         echo "Running transaction stress test..."
-        timeout 300s zig build-exe benchmarks/transaction_stress_test.zig -I src/ -O ReleaseFast
+        cp benchmarks/transaction_stress_test.zig .
+        timeout 300s zig build-exe transaction_stress_test.zig -I src/ -O ReleaseFast
         
         if [ -f transaction_stress_test ]; then
           echo "=== Transaction Stress Test Results ===" | tee benchmark-results/transactions.log
@@ -69,7 +71,8 @@ jobs:
     - name: Run checkpoint stress test  
       run: |
         echo "Running checkpoint stress test..."
-        timeout 300s zig build-exe benchmarks/checkpoint_stress_test.zig -I src/ -O ReleaseFast
+        cp benchmarks/checkpoint_stress_test.zig .
+        timeout 300s zig build-exe checkpoint_stress_test.zig -I src/ -O ReleaseFast
         
         if [ -f checkpoint_stress_test ]; then
           echo "=== Checkpoint Stress Test Results ===" | tee benchmark-results/checkpoint.log
@@ -79,7 +82,8 @@ jobs:
     - name: Run statistics validation
       run: |
         echo "Running statistics validation..."
-        timeout 300s zig build-exe benchmarks/statistics_validation.zig -I src/ -O ReleaseFast
+        cp benchmarks/statistics_validation.zig .
+        timeout 300s zig build-exe statistics_validation.zig -I src/ -O ReleaseFast
         
         if [ -f statistics_validation ]; then
           echo "=== Statistics Validation Results ===" | tee benchmark-results/statistics.log
