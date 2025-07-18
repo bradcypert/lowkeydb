@@ -1,5 +1,5 @@
 const std = @import("std");
-const Database = @import("root.zig").Database;
+const Database = @import("src/root.zig").Database;
 
 const ThreadData = struct {
     db: *Database,
